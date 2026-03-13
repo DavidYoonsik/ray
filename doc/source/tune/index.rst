@@ -1,17 +1,25 @@
-.. include:: /_includes/tune/announcement.rst
-
 .. _tune-main:
 
 Ray Tune: Hyperparameter Tuning
 ===============================
+
+.. toctree::
+    :hidden:
+
+    Getting Started <getting-started>
+    Key Concepts <key-concepts>
+    tutorials/overview
+    examples/index
+    faq
+    api/api
 
 .. image:: images/tune_overview.png
     :scale: 50%
     :align: center
 
 Tune is a Python library for experiment execution and hyperparameter tuning at any scale.
-You can tune your favorite machine learning framework (:ref:`PyTorch <tune-pytorch-cifar-ref>`, :ref:`XGBoost <tune-xgboost-ref>`, :doc:`Scikit-Learn <examples/tune-sklearn>`, :doc:`TensorFlow and Keras <examples/tune_mnist_keras>`, and :doc:`more <examples/index>`) by running state of the art algorithms such as :ref:`Population Based Training (PBT) <tune-scheduler-pbt>` and :ref:`HyperBand/ASHA <tune-scheduler-hyperband>`.
-Tune further integrates with a wide range of additional hyperparameter optimization tools, including :doc:`Ax <examples/ax_example>`, :doc:`BayesOpt <examples/bayesopt_example>`, :doc:`BOHB <examples/bohb_example>`, :doc:`Dragonfly <examples/dragonfly_example>`, :doc:`FLAML <examples/flaml_example>`, :doc:`HEBO <examples/hebo_example>`, :doc:`Hyperopt <examples/hyperopt_example>`, :doc:`Nevergrad <examples/nevergrad_example>`, :doc:`Optuna <examples/optuna_example>`, :doc:`SigOpt <examples/sigopt_example>`, :doc:`skopt <examples/skopt_example>`, and :doc:`ZOOpt <examples/zoopt_example>`.
+You can tune your favorite machine learning framework (:ref:`PyTorch <tune-pytorch-cifar-ref>`, :ref:`XGBoost <tune-xgboost-ref>`, :doc:`TensorFlow and Keras <examples/tune_mnist_keras>`, and :doc:`more <examples/index>`) by running state of the art algorithms such as :ref:`Population Based Training (PBT) <tune-scheduler-pbt>` and :ref:`HyperBand/ASHA <tune-scheduler-hyperband>`.
+Tune further integrates with a wide range of additional hyperparameter optimization tools, including :doc:`Ax <examples/ax_example>`, :doc:`BayesOpt <examples/bayesopt_example>`, :doc:`BOHB <examples/bohb_example>`, :doc:`Nevergrad <examples/nevergrad_example>`, and :doc:`Optuna <examples/optuna_example>`.
 
 **Click on the following tabs to see code examples for various machine learning frameworks**:
 
@@ -23,7 +31,7 @@ Tune further integrates with a wide range of additional hyperparameter optimizat
 
         In this quick-start example you `minimize` a simple function of the form ``f(x) = a**2 + b``, our `objective` function.
         The closer ``a`` is to zero and the smaller ``b`` is, the smaller the total value of ``f(x)``.
-        We will define a so-called `search space` for  ``a`` and ``b`` and let Ray Tune explore the space for good values.
+        We will define a so-called `search space` for ``a`` and ``b`` and let Ray Tune explore the space for good values.
 
         .. callout::
 
@@ -253,7 +261,7 @@ Feel free to submit a pull-request adding (or requesting a removal!) of a listed
 
 - `Softlearning <https://github.com/rail-berkeley/softlearning>`_: Softlearning is a reinforcement learning framework for training maximum entropy policies in continuous domains. Includes the official implementation of the Soft Actor-Critic algorithm.
 - `Flambe <https://github.com/asappresearch/flambe>`_: An ML framework to accelerate research and its path to production. See `flambe.ai <https://flambe.ai>`_.
-- `Population Based Augmentation <https://github.com/arcelien/pba>`_: Population Based Augmentation (PBA) is a algorithm that quickly and efficiently learns data augmentation functions for neural network training. PBA matches state-of-the-art results on CIFAR with one thousand times less compute.
+- `Population Based Augmentation <https://github.com/arcelien/pba>`_: Population Based Augmentation (PBA) is an algorithm that quickly and efficiently learns data augmentation functions for neural network training. PBA matches state-of-the-art results on CIFAR with one thousand times less compute.
 - `Fast AutoAugment by Kakao <https://github.com/kakaobrain/fast-autoaugment>`_: Fast AutoAugment (Accepted at NeurIPS 2019) learns augmentation policies using a more efficient search strategy based on density matching.
 - `Allentune <https://github.com/allenai/allentune>`_: Hyperparameter Search for AllenNLP from AllenAI.
 - `machinable <https://github.com/frthjf/machinable>`_: A modular configuration system for machine learning research. See `machinable.org <https://machinable.org>`_.
@@ -266,9 +274,8 @@ Learn More About Ray Tune
 
 Below you can find blog posts and talks about Ray Tune:
 
-- [blog] `Tune: a Python library for fast hyperparameter tuning at any scale <https://towardsdatascience.com/fast-hyperparameter-tuning-at-scale-d428223b081c>`_
+- [blog] `Tune: a Python library for fast hyperparameter tuning at any scale <https://medium.com/data-science/fast-hyperparameter-tuning-at-scale-d428223b081c>`_
 - [blog] `Cutting edge hyperparameter tuning with Ray Tune <https://medium.com/riselab/cutting-edge-hyperparameter-tuning-with-ray-tune-be6c0447afdf>`_
-- [blog] `Simple hyperparameter and architecture search in tensorflow with Ray Tune <http://louiskirsch.com/ai/ray-tune>`_
 - [slides] `Talk given at RISECamp 2019 <https://docs.google.com/presentation/d/1v3IldXWrFNMK-vuONlSdEuM82fuGTrNUDuwtfx4axsQ/edit?usp=sharing>`_
 - [video] `Talk given at RISECamp 2018 <https://www.youtube.com/watch?v=38Yd_dXW51Q>`_
 - [video] `A Guide to Modern Hyperparameter Optimization (PyData LA 2019) <https://www.youtube.com/watch?v=10uz5U3Gy6E>`_ (`slides <https://speakerdeck.com/richardliaw/a-modern-guide-to-hyperparameter-optimization>`_)
@@ -288,5 +295,3 @@ Here is an example bibtex:
         journal={arXiv preprint arXiv:1807.05118},
         year={2018}
     }
-
-.. include:: /_includes/tune/announcement_bottom.rst

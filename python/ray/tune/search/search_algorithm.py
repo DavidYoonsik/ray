@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, Union, TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from ray.util.annotations import DeveloperAPI
 
@@ -44,7 +44,7 @@ class SearchAlgorithm:
             metric: Metric to optimize
             mode: One of ["min", "max"]. Direction to optimize.
             config: Tune config dict.
-            **spec: Any kwargs for forward compatiblity.
+            **spec: Any kwargs for forward compatibility.
                 Info like Experiment.PUBLIC_KEYS is provided through here.
         """
         if self._metric and metric:

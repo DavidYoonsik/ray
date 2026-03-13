@@ -1,10 +1,10 @@
-from filelock import FileLock
 import hashlib
 import os
 from pathlib import Path
 
-import ray
+from filelock import FileLock
 
+import ray
 
 RAY_LOCKFILE_DIR = "_ray_lockfiles"
 
@@ -25,9 +25,9 @@ class TempFileLock:
 
     def __init__(self, path: str, **kwargs):
         self.path = path
-        temp_dir = Path(ray._private.utils.get_user_temp_dir()).resolve()
+        temp_dir = Path(ray._common.utils.get_default_system_temp_dir()).resolve()
         self._lock_dir = temp_dir / RAY_LOCKFILE_DIR
-        self._path_hash = hashlib.md5(
+        self._path_hash = hashlib.sha256(
             str(Path(self.path).resolve()).encode("utf-8")
         ).hexdigest()
         self._lock_path = self._lock_dir / f"{self._path_hash}.lock"

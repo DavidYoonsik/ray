@@ -1,12 +1,11 @@
 import gymnasium as gym
 import numpy as np
+from gymnasium.envs.classic_control.cartpole import CartPoleEnv
 from PIL import Image, ImageDraw
 
-from gymnasium.envs.classic_control.cartpole import CartPoleEnv
+from ray.rllib.utils.framework import try_import_torch
 
-from ray.rllib.utils.framework import try_import_tf
-
-_, tf, _ = try_import_tf()
+torch, _ = try_import_torch()
 
 
 class CartPoleDebug(CartPoleEnv):
@@ -19,17 +18,22 @@ class CartPoleDebug(CartPoleEnv):
         self.observation_space = gym.spaces.Box(low, high, shape=(5,), dtype=np.float32)
 
         self.timesteps_ = 0
+        self._next_action = 0
+        self._seed = 1
 
     def reset(self, *, seed=None, options=None):
-        ret = super().reset()
+        ret = super().reset(seed=self._seed)
+        self._seed += 1
         self.timesteps_ = 0
+        self._next_action = 0
         obs = np.concatenate([np.array([self.timesteps_]), ret[0]])
         return obs, ret[1]
 
     def step(self, action):
-        ret = super().step(action)
+        ret = super().step(self._next_action)
 
         self.timesteps_ += 1
+        self._next_action = 0 if self._next_action else 1
 
         obs = np.concatenate([np.array([self.timesteps_]), ret[0]])
         reward = 0.1 * self.timesteps_
@@ -94,7 +98,7 @@ def create_cartpole_dream_image(
     # Return image.
     np_img = np.asarray(image)
     if as_tensor:
-        return tf.convert_to_tensor(np_img, dtype=tf.uint8)
+        return torch.from_numpy(np_img, dtype=torch.uint8)
     return np_img
 
 
@@ -138,7 +142,7 @@ def create_frozenlake_dream_image(
     # Return image.
     np_img = np.asarray(image)
     if as_tensor:
-        return tf.convert_to_tensor(np_img, dtype=tf.uint8)
+        return torch.from_numpy(np_img, dtype=torch.uint8)
     return np_img
 
 

@@ -1,16 +1,18 @@
 import json
 import os
 import posixpath
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Union
 
 import pandas as pd
 import pyarrow
 import pyarrow as pa
 import pytest
+from packaging.version import parse as parse_version
 from pyarrow.fs import FileType
-from pytest_lazyfixture import lazy_fixture
+from pytest_lazy_fixtures import lf as lazy_fixture
 
 import ray
+from ray.data._internal.utils.arrow_utils import get_pyarrow_version
 from ray.data.block import Block
 from ray.data.dataset import Dataset
 from ray.data.datasource import FileBasedDatasource, PathPartitionParser
@@ -20,24 +22,32 @@ from ray.data.datasource.partitioning import (
     PartitionStyle,
     PathPartitionFilter,
 )
+from ray.data.expressions import col
 from ray.data.tests.conftest import *  # noqa
 from ray.tests.conftest import *  # noqa
 
 
 class CSVDatasource(FileBasedDatasource):
-    def __init__(self, block_type: Union[pd.DataFrame, pa.Table]):
+    def __init__(
+        self,
+        paths,
+        block_type: Union[pd.DataFrame, pa.Table],
+        **file_based_datasource_kwargs,
+    ):
+        super().__init__(paths, **file_based_datasource_kwargs)
+
         self._block_type = block_type
 
-    def _read_file(self, f: pa.NativeFile, path: str, **kwargs) -> Block:
+    def _read_stream(self, f: pa.NativeFile, path: str) -> Iterator[Block]:
         assert self._block_type in {pd.DataFrame, pa.Table}
 
         if self._block_type is pa.Table:
             from pyarrow import csv
 
-            return csv.read_csv(f)
+            yield csv.read_csv(f)
 
         if self._block_type is pd.DataFrame:
-            return pd.read_csv(f)
+            yield pd.read_csv(f)
 
 
 def write_csv(data: Dict[str, List[Any]], path: str) -> None:
@@ -52,8 +62,8 @@ def read_csv(
     partitioning: Partitioning,
     block_type: Union[pd.DataFrame, pa.Table],
 ) -> Dataset:
-    datasource = CSVDatasource(block_type=block_type)
-    return ray.data.read_datasource(datasource, paths=paths, partitioning=partitioning)
+    datasource = CSVDatasource(paths, block_type=block_type, partitioning=partitioning)
+    return ray.data.read_datasource(datasource)
 
 
 class PathPartitionEncoder:
@@ -90,7 +100,7 @@ class PathPartitionEncoder:
         Returns:
             The new partition path encoder.
         """
-        scheme = Partitioning(style, base_dir, field_names, filesystem)
+        scheme = Partitioning(style, base_dir, field_names, None, filesystem)
         return PathPartitionEncoder(scheme)
 
     def __init__(self, partitioning: Partitioning):
@@ -648,15 +658,24 @@ def test_path_partition_parser_hive(fs, base_dir):
     partitioned_path = posixpath.join(base_dir, "foo/bar/qux=3/")
     assert partition_parser(partitioned_path) == {"qux": "3"}
 
-    partition_parser = PathPartitionParser.of(
-        base_dir=base_dir,
-        field_names=["foo", "bar"],
-        filesystem=fs,
-    )
-    partitioned_path = posixpath.join(base_dir, "foo=1/bar=2/test")
-    assert partition_parser(partitioned_path) == {"foo": "1", "bar": "2"}
-    partitioned_path = posixpath.join(base_dir, "prefix/foo=1/padding/bar=2/test")
-    assert partition_parser(partitioned_path) == {"foo": "1", "bar": "2"}
+
+@pytest.mark.parametrize(
+    "path, expected_partitions",
+    [
+        # '%2F' should decode to '/'
+        ("bucket/key=partition%2Fvalue/file.txt", {"key": "partition/value"}),
+        # '+' must remain literal when decoding path components. See
+        # https://github.com/ray-project/ray/pull/57625#discussion_r2441360523.
+        ("bucket/key=foo+bar/file.txt", {"key": "foo+bar"}),
+        # '%2B' should decode to '+'
+        ("bucket/key=foo%2Bbar/file.txt", {"key": "foo+bar"}),
+    ],
+)
+def test_path_partition_parser_decodes_special_characters(
+    path: str, expected_partitions: Dict[str, str]
+):
+    partition_parser = PathPartitionParser.of(base_dir="bucket")
+    assert partition_parser(path) == expected_partitions
 
 
 @pytest.mark.parametrize(
@@ -868,6 +887,110 @@ def test_path_partition_filter_directory(fs, base_dir):
         posixpath.join(base_dir, "1/2/"),
         posixpath.join(base_dir, "1/2/3"),
     ]
+
+
+@pytest.mark.parametrize(
+    "partition_value,expected_type",
+    [
+        ("1", int),
+        ("1.0", float),
+        ("spam", str),
+        ("true", bool),
+    ],
+)
+def test_field_types(partition_value, expected_type):
+    partitioning = Partitioning(style="hive", field_types={"key": expected_type})
+    parse = PathPartitionParser(partitioning)
+
+    partitions = parse(f"key={partition_value}/data.parquet")
+
+    assert set(partitions.keys()) == {"key"}
+    assert isinstance(partitions["key"], expected_type)
+
+
+@pytest.mark.parametrize(
+    "path,predicate,expected_result,description",
+    [
+        # Simple equality matches
+        ("country=US/file.parquet", col("country") == "US", True, "Exact match"),
+        ("country=US/file.parquet", col("country") == "UK", False, "No match"),
+        # AND predicates
+        (
+            "country=US/year=2020/file.parquet",
+            (col("country") == "US") & (col("year") == "2020"),
+            True,
+            "AND both match",
+        ),
+        (
+            "country=US/year=2020/file.parquet",
+            (col("country") == "US") & (col("year") == "2021"),
+            False,
+            "AND one doesn't match",
+        ),
+        # OR predicates
+        (
+            "country=US/file.parquet",
+            (col("country") == "US") | (col("country") == "UK"),
+            True,
+            "OR first matches",
+        ),
+        (
+            "country=FR/file.parquet",
+            (col("country") == "US") | (col("country") == "UK"),
+            False,
+            "OR neither matches",
+        ),
+        # Comparison operators
+        ("year=2020/file.parquet", col("year") > "2019", True, "Greater than"),
+        ("year=2020/file.parquet", col("year") < "2019", False, "Less than"),
+        # NOT operator
+        ("country=US/file.parquet", ~(col("country") == "UK"), True, "NOT false"),
+        ("country=US/file.parquet", ~(col("country") == "US"), False, "NOT true"),
+        # IS_IN operator
+        (
+            "country=US/file.parquet",
+            col("country").is_in(["US", "UK"]),
+            True,
+            "IS_IN matches",
+        ),
+        (
+            "country=FR/file.parquet",
+            col("country").is_in(["US", "UK"]),
+            False,
+            "IS_IN no match",
+        ),
+        (
+            "year=2020/file.parquet",
+            col("year").is_in(["2019", "2020", "2021"]),
+            True,
+            "IS_IN with multiple values",
+        ),
+    ],
+)
+@pytest.mark.skipif(
+    get_pyarrow_version() < parse_version("14.0.0"),
+    reason="Partition predicate evaluation requires pyarrow >= 14.0.0",
+)
+def test_evaluate_predicate_on_partition(path, predicate, expected_result, description):
+    """Test partition predicate evaluation for automatic partition pruning."""
+    parser = PathPartitionParser(Partitioning("hive"))
+    result = parser.evaluate_predicate_on_partition(path, predicate)
+
+    assert (
+        result == expected_result
+    ), f"{description}: Expected {expected_result}, got {result}"
+
+
+def test_evaluate_predicate_on_unpartitioned_file():
+    """Test that unpartitioned files are conservatively included."""
+    parser = PathPartitionParser(Partitioning("hive"))
+    # Unpartitioned file should return False when filtering on partition columns
+    # (we can't determine if it matches the predicate without partition values)
+    result = parser.evaluate_predicate_on_partition(
+        "data.parquet", col("country") == "US"
+    )
+
+    assert result is False
 
 
 if __name__ == "__main__":

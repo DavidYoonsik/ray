@@ -3,10 +3,13 @@ import logging
 
 import ray
 import requests
-from ray import serve
 from ray._private.test_utils import monitor_memory_usage
 from ray.cluster_utils import Cluster
+from ray._common.network_utils import build_address
+
+from ray import serve
 from ray.serve.config import DeploymentMode
+from ray.serve.context import _get_global_client
 
 logger = logging.getLogger(__file__)
 
@@ -31,14 +34,12 @@ def setup_local_single_node_cluster(
             redis_port=6380 if i == 0 else None,
             num_cpus=num_cpu_per_node,
             num_gpus=0,
-            resources={str(i): 2},
+            resources={str(i): 2, "proxy": 1},
         )
     ray.init(address=cluster.address, dashboard_host="0.0.0.0", namespace=namespace)
-    serve_client = serve.start(
-        detached=True, http_options={"location": DeploymentMode.EveryNode}
-    )
+    serve.start(proxy_location=DeploymentMode.EveryNode)
 
-    return serve_client, cluster
+    return _get_global_client(), cluster
 
 
 def setup_anyscale_cluster():
@@ -57,12 +58,12 @@ def setup_anyscale_cluster():
         # to reduce spam.
         runtime_env={"env_vars": {"SERVE_ENABLE_SCALING_LOG": "0"}},
     )
-    serve_client = serve.start(http_options={"location": DeploymentMode.EveryNode})
+    serve.start(proxy_location=DeploymentMode.EveryNode)
 
     # Print memory usage on the head node to help diagnose/debug memory leaks.
     monitor_memory_usage()
 
-    return serve_client
+    return _get_global_client()
 
 
 @ray.remote
@@ -79,7 +80,8 @@ def warm_up_one_cluster(
     for _ in range(num_warmup_iterations):
         try:
             resp = requests.get(
-                f"http://{http_host}:{http_port}/{endpoint}", timeout=timeout
+                f"http://{build_address(http_host, http_port)}/{endpoint}",
+                timeout=timeout,
             ).text
             logger.info(resp)
         except requests.exceptions.ReadTimeout:

@@ -8,7 +8,7 @@ import io.ray.runtime.serializer.MessagePackSerializer;
 import io.ray.serve.common.Constants;
 import io.ray.serve.exception.RayServeException;
 import io.ray.serve.generated.DeploymentLanguage;
-import io.ray.serve.util.LogUtil;
+import io.ray.serve.util.MessageFormatter;
 import java.io.Serializable;
 
 /** Configuration options for a deployment, to be set by the user. */
@@ -23,10 +23,10 @@ public class DeploymentConfig implements Serializable {
   private Integer numReplicas = 1;
 
   /**
-   * The maximum number of queries that can be sent to a replica of this deployment without
+   * The maximum number of requests that can be sent to a replica of this deployment without
    * receiving a response. Defaults to 100.
    */
-  private Integer maxConcurrentQueries = 100;
+  private Integer maxOngoingRequests = 100;
 
   /**
    * Arguments to pass to the reconfigure method of the deployment. The reconfigure method is called
@@ -54,6 +54,8 @@ public class DeploymentConfig implements Serializable {
 
   private AutoscalingConfig autoscalingConfig;
 
+  private RequestRouterConfig routerConfig;
+
   /** This flag is used to let replica know they are deplyed from a different language. */
   private Boolean isCrossLanguage = false;
 
@@ -63,6 +65,8 @@ public class DeploymentConfig implements Serializable {
   private String version;
 
   private String prevVersion;
+
+  private Integer maxConstructorRetryCount = 20;
 
   public Integer getNumReplicas() {
     return numReplicas;
@@ -75,14 +79,27 @@ public class DeploymentConfig implements Serializable {
     return this;
   }
 
-  public Integer getMaxConcurrentQueries() {
-    return maxConcurrentQueries;
+  public Integer getMaxOngoingRequests() {
+    return maxOngoingRequests;
   }
 
-  public DeploymentConfig setMaxConcurrentQueries(Integer maxConcurrentQueries) {
-    if (maxConcurrentQueries != null) {
-      Preconditions.checkArgument(maxConcurrentQueries > 0, "max_concurrent_queries must be > 0");
-      this.maxConcurrentQueries = maxConcurrentQueries;
+  public DeploymentConfig setMaxOngoingRequests(Integer maxOngoingRequests) {
+    if (maxOngoingRequests != null) {
+      Preconditions.checkArgument(maxOngoingRequests > 0, "max_ongoing_requests must be > 0");
+      this.maxOngoingRequests = maxOngoingRequests;
+    }
+    return this;
+  }
+
+  public Integer getMaxConstructorRetryCount() {
+    return maxConstructorRetryCount;
+  }
+
+  public DeploymentConfig setMaxConstructorRetryCount(Integer maxConstructorRetryCount) {
+    if (maxConstructorRetryCount != null) {
+      Preconditions.checkArgument(
+          maxConstructorRetryCount > 0, "max constructor retry count must be > 0");
+      this.maxConstructorRetryCount = maxConstructorRetryCount;
     }
     return this;
   }
@@ -140,12 +157,43 @@ public class DeploymentConfig implements Serializable {
     return this;
   }
 
+  public Double getRequestRoutingStatsPeriodS() {
+    return routerConfig.getRequestRoutingStatsPeriodS();
+  }
+
+  public DeploymentConfig setRequestRoutingStatsPeriodS(Double requestRoutingStatsPeriodS) {
+    if (requestRoutingStatsPeriodS != null) {
+      routerConfig.setRequestRoutingStatsPeriodS(requestRoutingStatsPeriodS);
+    }
+    return this;
+  }
+
+  public Double getRequestRoutingStatsTimeoutS() {
+    return routerConfig.getRequestRoutingStatsTimeoutS();
+  }
+
+  public DeploymentConfig setRequestRoutingStatsTimeoutS(Double requestRoutingStatsTimeoutS) {
+    if (requestRoutingStatsTimeoutS != null) {
+      routerConfig.setRequestRoutingStatsTimeoutS(requestRoutingStatsTimeoutS);
+    }
+    return this;
+  }
+
   public AutoscalingConfig getAutoscalingConfig() {
     return autoscalingConfig;
   }
 
   public DeploymentConfig setAutoscalingConfig(AutoscalingConfig autoscalingConfig) {
     this.autoscalingConfig = autoscalingConfig;
+    return this;
+  }
+
+  public RequestRouterConfig getRequestRouterConfig() {
+    return routerConfig;
+  }
+
+  public DeploymentConfig setRequestRouterConfig(RequestRouterConfig routerConfig) {
+    this.routerConfig = routerConfig;
     return this;
   }
 
@@ -176,8 +224,9 @@ public class DeploymentConfig implements Serializable {
     return version;
   }
 
-  public void setVersion(String version) {
+  public DeploymentConfig setVersion(String version) {
     this.version = version;
+    return this;
   }
 
   public String getPrevVersion() {
@@ -192,18 +241,24 @@ public class DeploymentConfig implements Serializable {
     io.ray.serve.generated.DeploymentConfig.Builder builder =
         io.ray.serve.generated.DeploymentConfig.newBuilder()
             .setNumReplicas(numReplicas)
-            .setMaxConcurrentQueries(maxConcurrentQueries)
+            .setMaxOngoingRequests(maxOngoingRequests)
+            .setMaxQueuedRequests(-1)
             .setGracefulShutdownWaitLoopS(gracefulShutdownWaitLoopS)
             .setGracefulShutdownTimeoutS(gracefulShutdownTimeoutS)
             .setHealthCheckPeriodS(healthCheckPeriodS)
             .setHealthCheckTimeoutS(healthCheckTimeoutS)
             .setIsCrossLanguage(isCrossLanguage)
-            .setDeploymentLanguage(deploymentLanguage);
+            .setDeploymentLanguage(deploymentLanguage)
+            .setVersion(version)
+            .setMaxConstructorRetryCount(maxConstructorRetryCount);
     if (null != userConfig) {
       builder.setUserConfig(ByteString.copyFrom(MessagePackSerializer.encode(userConfig).getKey()));
     }
     if (null != autoscalingConfig) {
       builder.setAutoscalingConfig(autoscalingConfig.toProto());
+    }
+    if (null != routerConfig) {
+      builder.setRequestRouterConfig(routerConfig.toProto());
     }
     return builder.build().toByteArray();
   }
@@ -212,18 +267,22 @@ public class DeploymentConfig implements Serializable {
     io.ray.serve.generated.DeploymentConfig.Builder builder =
         io.ray.serve.generated.DeploymentConfig.newBuilder()
             .setNumReplicas(numReplicas)
-            .setMaxConcurrentQueries(maxConcurrentQueries)
+            .setMaxOngoingRequests(maxOngoingRequests)
             .setGracefulShutdownWaitLoopS(gracefulShutdownWaitLoopS)
             .setGracefulShutdownTimeoutS(gracefulShutdownTimeoutS)
             .setHealthCheckPeriodS(healthCheckPeriodS)
             .setHealthCheckTimeoutS(healthCheckTimeoutS)
             .setIsCrossLanguage(isCrossLanguage)
-            .setDeploymentLanguage(deploymentLanguage);
+            .setDeploymentLanguage(deploymentLanguage)
+            .setMaxConstructorRetryCount(maxConstructorRetryCount);
     if (null != userConfig) {
       builder.setUserConfig(ByteString.copyFrom(MessagePackSerializer.encode(userConfig).getKey()));
     }
     if (null != autoscalingConfig) {
       builder.setAutoscalingConfig(autoscalingConfig.toProto());
+    }
+    if (null != routerConfig) {
+      builder.setRequestRouterConfig(routerConfig.toProto());
     }
     return builder.build();
   }
@@ -235,13 +294,13 @@ public class DeploymentConfig implements Serializable {
       return deploymentConfig;
     }
     deploymentConfig.setNumReplicas(proto.getNumReplicas());
-    deploymentConfig.setMaxConcurrentQueries(proto.getMaxConcurrentQueries());
+    deploymentConfig.setMaxOngoingRequests(proto.getMaxOngoingRequests());
     deploymentConfig.setGracefulShutdownWaitLoopS(proto.getGracefulShutdownWaitLoopS());
     deploymentConfig.setGracefulShutdownTimeoutS(proto.getGracefulShutdownTimeoutS());
     deploymentConfig.setCrossLanguage(proto.getIsCrossLanguage());
     if (proto.getDeploymentLanguage() == DeploymentLanguage.UNRECOGNIZED) {
       throw new RayServeException(
-          LogUtil.format(
+          MessageFormatter.format(
               "Unrecognized deployment language {}. Deployment language must be in {}.",
               proto.getDeploymentLanguage(),
               Lists.newArrayList(DeploymentLanguage.values())));
@@ -251,6 +310,9 @@ public class DeploymentConfig implements Serializable {
       deploymentConfig.setUserConfig(
           MessagePackSerializer.decode(
               proto.getUserConfig().toByteArray(), Object.class)); // TODO-xlang
+    }
+    if (proto.getMaxConstructorRetryCount() > 0) {
+      deploymentConfig.setMaxConstructorRetryCount(proto.getMaxConstructorRetryCount());
     }
     return deploymentConfig;
   }

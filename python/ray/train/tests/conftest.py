@@ -1,16 +1,17 @@
-# Trigger pytest hook to automatically zip test cluster logs to archive dir on failure
-from ray.tests.conftest import pytest_runtest_makereport  # noqa
-from ray.tests.conftest import propagate_logs  # noqa
-
-import boto3
 import logging
 
+import boto3
 import pytest
 
 import ray
-from ray.air._internal.uri_utils import URI
+from ray._common.test_utils import simulate_s3_bucket
 from ray.cluster_utils import Cluster
-from ray._private.test_utils import simulate_storage
+
+# Trigger pytest hook to automatically zip test cluster logs to archive dir on failure
+from ray.tests.conftest import (
+    propagate_logs,  # noqa
+    pytest_runtest_makereport,  # noqa
+)
 
 
 @pytest.fixture
@@ -47,6 +48,20 @@ def ray_2_node_2_gpu():
     cluster = Cluster()
     for _ in range(2):
         cluster.add_node(num_cpus=4, num_gpus=2)
+
+    ray.init(address=cluster.address)
+
+    yield
+
+    ray.shutdown()
+    cluster.shutdown()
+
+
+@pytest.fixture
+def ray_2_node_2_neuron_cores():
+    cluster = Cluster()
+    for _ in range(2):
+        cluster.add_node(num_cpus=4, resources={"neuron_cores": 2})
 
     ray.init(address=cluster.address)
 
@@ -108,9 +123,11 @@ def ray_2_node_2_cpu():
 
 @pytest.fixture
 def mock_s3_bucket_uri():
+    from ray.air._internal.uri_utils import URI
+
     port = 5002
     region = "us-west-2"
-    with simulate_storage("s3", port=port, region=region) as s3_uri:
+    with simulate_s3_bucket(port=port, region=region) as s3_uri:
         s3 = boto3.client(
             "s3", region_name=region, endpoint_url=f"http://localhost:{port}"
         )

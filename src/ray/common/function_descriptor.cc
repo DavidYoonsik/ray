@@ -14,6 +14,8 @@
 
 #include "ray/common/function_descriptor.h"
 
+#include "ray/util/logging.h"
+
 namespace ray {
 FunctionDescriptor FunctionDescriptorBuilder::Empty() {
   static ray::FunctionDescriptor empty =
@@ -97,7 +99,7 @@ FunctionDescriptor FunctionDescriptorBuilder::FromVector(
         function_descriptor_list[1],   // caller
         function_descriptor_list[2]);  // class name
   } else {
-    RAY_LOG(FATAL) << "Unspported language " << language;
+    RAY_LOG(FATAL) << "Unsupported language " << language;
     return FunctionDescriptorBuilder::Empty();
   }
 }

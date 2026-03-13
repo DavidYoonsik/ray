@@ -13,12 +13,33 @@
             "metadata": {
                 "description": "Subnet parameters."
             }
+        },
+        "msiName": {
+            "type": "string",
+            "metadata": {
+                "description": "Managed service identity."
+            }
+        },
+        "msiResourceGroup": {
+            "type": "string",
+            "metadata": {
+                "description": "Managed service identity resource group."
+            }
+        },
+        "createMsi": {
+            "type": "bool",
+            "defaultValue": "true"
+        },
+        "roleAssignmentGuid": {
+            "type": "string",
+            "metadata": {
+                "description": "Deterministic resource name for the MSI role assignment."
+            }
         }
     },
     "variables": {
         "contributor": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b24988ac-6180-42a0-ab88-20f7382dd24c')]",
         "location": "[resourceGroup().location]",
-        "msiName": "[concat('ray-', parameters('clusterId'), '-msi')]",
         "roleAssignmentName": "[concat('ray-', parameters('clusterId'), '-ra')]",
         "nsgName": "[concat('ray-', parameters('clusterId'), '-nsg')]",
         "nsg": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]",
@@ -27,28 +48,30 @@
     },
     "resources": [
        {
+            "condition": "[parameters('createMsi')]",
             "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
-            "apiVersion": "2018-11-30",
+            "apiVersion": "2024-11-30",
             "location": "[variables('location')]",
-            "name": "[variables('msiName')]"
+            "name": "[parameters('msiName')]"
         },
         {
             "type": "Microsoft.Authorization/roleAssignments",
-            "apiVersion": "2020-08-01-preview",
-            "name": "[guid(variables('roleAssignmentName'))]",
+            "apiVersion": "2022-04-01",
+            "name": "[parameters('roleAssignmentGuid')]",
             "properties": {
-                "principalId": "[reference(variables('msiName')).principalId]",
+                "principalId": "[reference(resourceId(parameters('msiResourceGroup'), 'Microsoft.ManagedIdentity/userAssignedIdentities', parameters('msiName')), '2024-11-30').principalId]",
                 "roleDefinitionId": "[variables('contributor')]",
                 "scope": "[resourceGroup().id]",
-                "principalType": "ServicePrincipal"
+                "principalType": "ServicePrincipal",
+                "description": "[concat('Ray autoscaler cluster ', parameters('clusterId'))]"
             },
             "dependsOn": [
-                "[variables('msiName')]"
+                "[parameters('msiName')]"
             ]
         },
         {
             "type": "Microsoft.Network/networkSecurityGroups",
-            "apiVersion": "2019-02-01",
+            "apiVersion": "2024-10-01",
             "name": "[variables('nsgName')]",
             "location": "[variables('location')]",
             "properties": {
@@ -57,7 +80,7 @@
                         "name": "SSH",
                         "properties": {
                             "priority": 1000,
-                            "protocol": "TCP",
+                            "protocol": "Tcp",
                             "access": "Allow",
                             "direction": "Inbound",
                             "sourceAddressPrefix": "*",
@@ -71,7 +94,7 @@
         },
         {
             "type": "Microsoft.Network/virtualNetworks",
-            "apiVersion": "2019-11-01",
+            "apiVersion": "2024-10-01",
             "name": "[variables('vnetName')]",
             "location": "[variables('location')]",
             "properties": {
@@ -108,7 +131,7 @@
         },
         "msi": {
             "type": "string",
-            "value": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('msiName'))]"
+            "value": "[resourceId(parameters('msiResourceGroup'), 'Microsoft.ManagedIdentity/userAssignedIdentities', parameters('msiName'))]"
         }
     }
 }

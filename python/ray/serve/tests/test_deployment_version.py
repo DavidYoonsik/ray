@@ -1,208 +1,9 @@
 import pytest
 
 import ray
+from ray.serve._private.config import DeploymentConfig
 from ray.serve._private.deployment_state import DeploymentVersion
-from ray.serve.config import DeploymentConfig
-
-
-def test_validation():
-    # Code version must be a string.
-    with pytest.raises(TypeError):
-        DeploymentVersion(123, DeploymentConfig(), {})
-
-
-def test_other_type_equality():
-    v = DeploymentVersion("1", DeploymentConfig(), {})
-
-    assert v is not None
-    assert v != "1"
-    assert v != None  # noqa: E711
-
-
-def test_code_version():
-    v1 = DeploymentVersion("1", DeploymentConfig(), {})
-    v2 = DeploymentVersion("1", DeploymentConfig(), {})
-    v3 = DeploymentVersion("2", DeploymentConfig(), {})
-
-    assert v1 == v2
-    assert hash(v1) == hash(v2)
-    assert v1 != v3
-    assert hash(v1) != hash(v3)
-
-
-def test_deployment_config_basic():
-    v1 = DeploymentVersion("1", DeploymentConfig(user_config="1"), {})
-    v2 = DeploymentVersion("1", DeploymentConfig(user_config="1"), {})
-    v3 = DeploymentVersion("1", DeploymentConfig(user_config="2"), {})
-
-    assert v1 == v2
-    assert hash(v1) == hash(v2)
-    assert v1 != v3
-    assert hash(v1) != hash(v3)
-
-
-def test_user_config_hashable():
-    v1 = DeploymentVersion("1", DeploymentConfig(user_config=("1", "2")), {})
-    v2 = DeploymentVersion("1", DeploymentConfig(user_config=("1", "2")), {})
-    v3 = DeploymentVersion("1", DeploymentConfig(user_config=("1", "3")), {})
-
-    assert v1 == v2
-    assert hash(v1) == hash(v2)
-    assert v1 != v3
-    assert hash(v1) != hash(v3)
-
-
-def test_user_config_list():
-    v1 = DeploymentVersion("1", DeploymentConfig(user_config=["1", "2"]), {})
-    v2 = DeploymentVersion("1", DeploymentConfig(user_config=["1", "2"]), {})
-    v3 = DeploymentVersion("1", DeploymentConfig(user_config=["1", "3"]), {})
-
-    assert v1 == v2
-    assert hash(v1) == hash(v2)
-    assert v1 != v3
-    assert hash(v1) != hash(v3)
-
-
-def test_user_config_dict_keys():
-    v1 = DeploymentVersion("1", DeploymentConfig(user_config={"1": "1"}), {})
-    v2 = DeploymentVersion("1", DeploymentConfig(user_config={"1": "1"}), {})
-    v3 = DeploymentVersion("1", DeploymentConfig(user_config={"2": "1"}), {})
-
-    assert v1 == v2
-    assert hash(v1) == hash(v2)
-    assert v1 != v3
-    assert hash(v1) != hash(v3)
-
-
-def test_user_config_dict_vals():
-    v1 = DeploymentVersion("1", DeploymentConfig(user_config={"1": "1"}), {})
-    v2 = DeploymentVersion("1", DeploymentConfig(user_config={"1": "1"}), {})
-    v3 = DeploymentVersion("1", DeploymentConfig(user_config={"1": "2"}), {})
-
-    assert v1 == v2
-    assert hash(v1) == hash(v2)
-    assert v1 != v3
-    assert hash(v1) != hash(v3)
-
-
-def test_user_config_nested():
-    v1 = DeploymentVersion(
-        "1", DeploymentConfig(user_config=[{"1": "2"}, {"1": "2"}]), {}
-    )
-    v2 = DeploymentVersion(
-        "1", DeploymentConfig(user_config=[{"1": "2"}, {"1": "2"}]), {}
-    )
-    v3 = DeploymentVersion(
-        "1", DeploymentConfig(user_config=[{"1": "2"}, {"1": "3"}]), {}
-    )
-
-    assert v1 == v2
-    assert hash(v1) == hash(v2)
-    assert v1 != v3
-    assert hash(v1) != hash(v3)
-
-
-def test_user_config_nested_in_hashable():
-    v1 = DeploymentVersion(
-        "1", DeploymentConfig(user_config=([{"1": "2"}, {"1": "2"}])), {}
-    )
-    v2 = DeploymentVersion(
-        "1", DeploymentConfig(user_config=([{"1": "2"}, {"1": "2"}])), {}
-    )
-    v3 = DeploymentVersion(
-        "1", DeploymentConfig(user_config=([{"1": "2"}, {"1": "3"}])), {}
-    )
-
-    assert v1 == v2
-    assert hash(v1) == hash(v2)
-    assert v1 != v3
-    assert hash(v1) != hash(v3)
-
-
-def test_num_replicas():
-    v1 = DeploymentVersion("1", DeploymentConfig(num_replicas=1), {})
-    v2 = DeploymentVersion("1", DeploymentConfig(num_replicas=2), {})
-
-    assert v1 == v2
-    assert hash(v1) == hash(v2)
-
-
-def test_autoscaling_config():
-    v1 = DeploymentVersion(
-        "1", DeploymentConfig(autoscaling_config={"max_replicas": 2}), {}
-    )
-    v2 = DeploymentVersion(
-        "1", DeploymentConfig(autoscaling_config={"max_replicas": 5}), {}
-    )
-
-    assert v1 == v2
-    assert hash(v1) == hash(v2)
-
-
-def test_max_concurrent_queries():
-    v1 = DeploymentVersion("1", DeploymentConfig(max_concurrent_queries=5), {})
-    v2 = DeploymentVersion("1", DeploymentConfig(max_concurrent_queries=5), {})
-    v3 = DeploymentVersion("1", DeploymentConfig(max_concurrent_queries=10), {})
-
-    assert v1 == v2
-    assert hash(v1) == hash(v2)
-    assert v1 != v3
-    assert hash(v1) != hash(v3)
-
-
-def test_health_check_period_s():
-    v1 = DeploymentVersion("1", DeploymentConfig(health_check_period_s=5), {})
-    v2 = DeploymentVersion("1", DeploymentConfig(health_check_period_s=5), {})
-    v3 = DeploymentVersion("1", DeploymentConfig(health_check_period_s=10), {})
-
-    assert v1 == v2
-    assert hash(v1) == hash(v2)
-    assert v1 != v3
-    assert hash(v1) != hash(v3)
-
-
-def test_health_check_timeout_s():
-    v1 = DeploymentVersion("1", DeploymentConfig(health_check_timeout_s=5), {})
-    v2 = DeploymentVersion("1", DeploymentConfig(health_check_timeout_s=5), {})
-    v3 = DeploymentVersion("1", DeploymentConfig(health_check_timeout_s=10), {})
-
-    assert v1 == v2
-    assert hash(v1) == hash(v2)
-    assert v1 != v3
-    assert hash(v1) != hash(v3)
-
-
-def test_graceful_shutdown_timeout_s():
-    v1 = DeploymentVersion("1", DeploymentConfig(graceful_shutdown_timeout_s=5), {})
-    v2 = DeploymentVersion("1", DeploymentConfig(graceful_shutdown_timeout_s=5), {})
-    v3 = DeploymentVersion("1", DeploymentConfig(graceful_shutdown_timeout_s=10), {})
-
-    assert v1 == v2
-    assert hash(v1) == hash(v2)
-    assert v1 != v3
-    assert hash(v1) != hash(v3)
-
-
-def test_graceful_shutdown_wait_loop_s():
-    v1 = DeploymentVersion("1", DeploymentConfig(graceful_shutdown_wait_loop_s=5), {})
-    v2 = DeploymentVersion("1", DeploymentConfig(graceful_shutdown_wait_loop_s=5), {})
-    v3 = DeploymentVersion("1", DeploymentConfig(graceful_shutdown_wait_loop_s=10), {})
-
-    assert v1 == v2
-    assert hash(v1) == hash(v2)
-    assert v1 != v3
-    assert hash(v1) != hash(v3)
-
-
-def test_ray_actor_options():
-    v1 = DeploymentVersion("1", DeploymentConfig(), {"num_cpus": 0.1})
-    v2 = DeploymentVersion("1", DeploymentConfig(), {"num_cpus": 0.1})
-    v3 = DeploymentVersion("1", DeploymentConfig(), {"num_gpus": 0.1})
-
-    assert v1 == v2
-    assert hash(v1) == hash(v2)
-    assert v1 != v3
-    assert hash(v1) != hash(v3)
+from ray.serve.config import GangSchedulingConfig
 
 
 def test_hash_consistent_across_processes(serve_instance):
@@ -215,6 +16,102 @@ def test_hash_consistent_across_processes(serve_instance):
         )
 
     assert len(set(ray.get([get_version.remote() for _ in range(100)]))) == 1
+
+
+def test_route_prefix_changes_trigger_reconfigure_hash():
+    """Test that route prefix changes trigger a reconfigure hash change."""
+    cfg = DeploymentConfig()
+    v1 = DeploymentVersion(
+        code_version="same version",
+        deployment_config=cfg,
+        ray_actor_options={},
+        route_prefix="/a",
+    )
+    v2 = DeploymentVersion(
+        code_version="same version",
+        deployment_config=cfg,
+        ray_actor_options={},
+        route_prefix="/b",
+    )
+    assert v1.reconfigure_actor_hash != v2.reconfigure_actor_hash
+    # Should not require a full actor restart if nothing else changed
+    assert not v1.requires_actor_restart(v2)
+    assert v1.requires_actor_reconfigure(v2)
+
+
+def test_placement_group_options_trigger_restart():
+    """Test that changing a PG label selector or fallback strategy triggers an actor restart."""
+    cfg = DeploymentConfig()
+
+    # Initial deployment.
+    v1 = DeploymentVersion(
+        code_version="1",
+        deployment_config=cfg,
+        ray_actor_options={},
+        placement_group_bundles=[{"CPU": 1}],
+        placement_group_strategy="PACK",
+    )
+
+    # Change bundle_label_selector.
+    v2 = DeploymentVersion(
+        code_version="1",
+        deployment_config=cfg,
+        ray_actor_options={},
+        placement_group_bundles=[{"CPU": 1}],
+        placement_group_strategy="PACK",
+        placement_group_bundle_label_selector=[{"region": "us-west"}],
+    )
+
+    # Validate actor restart occurs due to differing hash.
+    assert v1.placement_group_options_hash != v2.placement_group_options_hash
+    assert v1.requires_actor_restart(v2)
+
+    # Change fallback_strategy.
+    v3 = DeploymentVersion(
+        code_version="1",
+        deployment_config=cfg,
+        ray_actor_options={},
+        placement_group_bundles=[{"CPU": 1}],
+        placement_group_strategy="PACK",
+        placement_group_fallback_strategy=[{"bundles": [{"CPU": 1}]}],
+    )
+
+    # Validate actor restart occurs due to differing hash.
+    assert v1.placement_group_options_hash != v3.placement_group_options_hash
+    assert v1.requires_actor_restart(v3)
+
+
+@pytest.mark.parametrize(
+    "gsc_kwargs,should_restart",
+    [
+        ({"gang_size": 2}, False),
+        ({"gang_size": 4}, True),
+        ({"gang_size": 2, "gang_placement_strategy": "PACK"}, False),
+        ({"gang_size": 2, "gang_placement_strategy": "SPREAD"}, True),
+        (None, True),
+    ],
+)
+def test_gang_scheduling_config_changes_trigger_restart(gsc_kwargs, should_restart):
+    """Test that changing gang_scheduling_config triggers an actor restart."""
+    config1 = GangSchedulingConfig(gang_size=2)
+    config2 = GangSchedulingConfig(**gsc_kwargs) if gsc_kwargs is not None else None
+
+    cfg1 = DeploymentConfig(num_replicas=4, gang_scheduling_config=config1)
+    v1 = DeploymentVersion(
+        code_version="1", deployment_config=cfg1, ray_actor_options={}
+    )
+
+    cfg2 = DeploymentConfig(num_replicas=4, gang_scheduling_config=config2)
+    v2 = DeploymentVersion(
+        code_version="1", deployment_config=cfg2, ray_actor_options={}
+    )
+
+    if should_restart:
+        assert v1.gang_scheduling_config_hash != v2.gang_scheduling_config_hash
+        assert v1.requires_actor_restart(v2)
+    else:
+        assert v1.gang_scheduling_config_hash == v2.gang_scheduling_config_hash
+        assert not v1.requires_actor_restart(v2)
 
 
 if __name__ == "__main__":

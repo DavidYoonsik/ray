@@ -1,11 +1,13 @@
-import gymnasium as gym
 import queue
 import threading
 import uuid
-from typing import Callable, Tuple, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
+import gymnasium as gym
+
+from ray._common.deprecation import deprecation_warning
 from ray.rllib.env.base_env import BaseEnv
-from ray.rllib.utils.annotations import override, PublicAPI
+from ray.rllib.utils.annotations import OldAPIStack, override
 from ray.rllib.utils.typing import (
     EnvActionType,
     EnvInfoDict,
@@ -13,13 +15,12 @@ from ray.rllib.utils.typing import (
     EnvType,
     MultiEnvDict,
 )
-from ray.rllib.utils.deprecation import deprecation_warning
 
 if TYPE_CHECKING:
     from ray.rllib.models.preprocessors import Preprocessor
 
 
-@PublicAPI
+@OldAPIStack
 class ExternalEnv(threading.Thread):
     """An environment that interfaces with external agents.
 
@@ -38,18 +39,18 @@ class ExternalEnv(threading.Thread):
 
     This env is thread-safe, but individual episodes must be executed serially.
 
-    Examples:
-        >>> from ray.tune import register_env
-        >>> from ray.rllib.algorithms.dqn import DQN # doctest: +SKIP
-        >>> YourExternalEnv = ... # doctest: +SKIP
-        >>> register_env("my_env", # doctest: +SKIP
-        ...     lambda config: YourExternalEnv(config))
-        >>> algo = DQN(env="my_env") # doctest: +SKIP
-        >>> while True: # doctest: +SKIP
-        >>>     print(algo.train()) # doctest: +SKIP
+    .. testcode::
+        :skipif: True
+
+        from ray.tune import register_env
+        from ray.rllib.algorithms.dqn import DQN
+        YourExternalEnv = ...
+        register_env("my_env", lambda config: YourExternalEnv(config))
+        algo = DQN(env="my_env")
+        while True:
+            print(algo.train())
     """
 
-    @PublicAPI
     def __init__(
         self,
         action_space: gym.Space,
@@ -80,7 +81,6 @@ class ExternalEnv(threading.Thread):
                 error=True,
             )
 
-    @PublicAPI
     def run(self):
         """Override this to implement the run loop.
 
@@ -95,7 +95,6 @@ class ExternalEnv(threading.Thread):
         """
         raise NotImplementedError
 
-    @PublicAPI
     def start_episode(
         self, episode_id: Optional[str] = None, training_enabled: bool = True
     ) -> str:
@@ -126,7 +125,6 @@ class ExternalEnv(threading.Thread):
 
         return episode_id
 
-    @PublicAPI
     def get_action(self, episode_id: str, observation: EnvObsType) -> EnvActionType:
         """Record an observation and get the on-policy action.
 
@@ -141,7 +139,6 @@ class ExternalEnv(threading.Thread):
         episode = self._get(episode_id)
         return episode.wait_for_action(observation)
 
-    @PublicAPI
     def log_action(
         self, episode_id: str, observation: EnvObsType, action: EnvActionType
     ) -> None:
@@ -156,7 +153,6 @@ class ExternalEnv(threading.Thread):
         episode = self._get(episode_id)
         episode.log_action(observation, action)
 
-    @PublicAPI
     def log_returns(
         self, episode_id: str, reward: float, info: Optional[EnvInfoDict] = None
     ) -> None:
@@ -178,7 +174,6 @@ class ExternalEnv(threading.Thread):
         if info:
             episode.cur_info = info or {}
 
-    @PublicAPI
     def end_episode(self, episode_id: str, observation: EnvObsType) -> None:
         """Records the end of an episode.
 
@@ -247,6 +242,7 @@ class ExternalEnv(threading.Thread):
         return env
 
 
+@OldAPIStack
 class _ExternalEnvEpisode:
     """Tracked state for each active episode."""
 
@@ -353,7 +349,7 @@ class _ExternalEnvEpisode:
             self.results_avail_condition.notify()
 
 
-@PublicAPI
+@OldAPIStack
 class ExternalEnvWrapper(BaseEnv):
     """Internal adapter of ExternalEnv to BaseEnv."""
 
@@ -477,12 +473,10 @@ class ExternalEnvWrapper(BaseEnv):
 
     @property
     @override(BaseEnv)
-    @PublicAPI
     def observation_space(self) -> gym.spaces.Dict:
         return self._observation_space
 
     @property
     @override(BaseEnv)
-    @PublicAPI
     def action_space(self) -> gym.Space:
         return self._action_space

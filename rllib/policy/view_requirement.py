@@ -1,19 +1,20 @@
 import dataclasses
-import gymnasium as gym
 from typing import Dict, List, Optional, Union
+
+import gymnasium as gym
 import numpy as np
 
-from ray.rllib.utils.annotations import PublicAPI
+from ray.rllib.utils.annotations import OldAPIStack
 from ray.rllib.utils.framework import try_import_torch
 from ray.rllib.utils.serialization import (
-    gym_space_to_dict,
     gym_space_from_dict,
+    gym_space_to_dict,
 )
 
 torch, _ = try_import_torch()
 
 
-@PublicAPI
+@OldAPIStack
 @dataclasses.dataclass
 class ViewRequirement:
     """Single view requirement (for one column in an SampleBatch/input_dict).
@@ -25,11 +26,16 @@ class ViewRequirement:
     column names (in the original data buffer), timestep shifts, and other
     options to build the view.
 
-    Examples:
-        >>> from ray.rllib.models.modelv2 import ModelV2
-        >>> # The default ViewRequirement for a Model is:
-        >>> req = ModelV2(...).view_requirements # doctest: +SKIP
-        >>> print(req) # doctest: +SKIP
+    .. testcode::
+        :skipif: True
+
+        from ray.rllib.models.modelv2 import ModelV2
+        # The default ViewRequirement for a Model is:
+        req = ModelV2(...).view_requirements
+        print(req)
+
+    .. testoutput::
+
         {"obs": ViewRequirement(shift=0)}
 
     Args:

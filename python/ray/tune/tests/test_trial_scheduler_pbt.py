@@ -1,32 +1,38 @@
-from functools import partial
-import numpy as np
+import json
 import os
 import pickle
-import pytest
 import random
-import unittest
 import sys
+import tempfile
 import time
+import unittest
+from functools import partial
+from typing import List, Optional
 from unittest.mock import MagicMock
 
+import numpy as np
+import pytest
 
 import ray
 from ray import cloudpickle, tune
-from ray.air import Checkpoint
-from ray.air._internal.checkpoint_manager import _TrackedCheckpoint, CheckpointStorage
-from ray.air.config import FailureConfig, RunConfig, CheckpointConfig
-from ray.tune import Trainable
+from ray._private.test_utils import object_memory_usage
+from ray.tune import (
+    Callback,
+    Checkpoint,
+    CheckpointConfig,
+    FailureConfig,
+    RunConfig,
+    Trainable,
+)
 from ray.tune.experiment import Trial
-from ray.tune.execution.trial_runner import TrialRunner
-from ray.tune.execution.ray_trial_executor import RayTrialExecutor
 from ray.tune.schedulers import PopulationBasedTraining
-from ray.tune.schedulers.pbt import _filter_mutated_params_from_config
 from ray.tune.schedulers.pb2 import PB2
 from ray.tune.schedulers.pb2_utils import UCB
+from ray.tune.schedulers.pbt import _filter_mutated_params_from_config
+from ray.tune.tests.execution.utils import create_execution_test_objects
 from ray.tune.tune_config import TuneConfig
-from ray._private.test_utils import object_memory_usage
+from ray.tune.utils.mock_trainable import MOCK_TRAINABLE_NAME, register_mock_trainable
 from ray.tune.utils.util import flatten_dict
-
 
 # Import psutil after ray so the packaged version is used.
 import psutil
@@ -43,6 +49,16 @@ class MockParam(object):
         val = self._params[self._index % len(self._params)]
         self._index += 1
         return val
+
+
+class DummyTrial:
+    def __init__(self, trial_id, finished=False, config: Optional[dict] = None):
+        self.trial_id = trial_id
+        self._finished = finished
+        self.config = config if config is not None else {}
+
+    def is_finished(self):
+        return self._finished
 
 
 class PopulationBasedTrainingMemoryTest(unittest.TestCase):
@@ -70,17 +86,18 @@ class PopulationBasedTrainingMemoryTest(unittest.TestCase):
 
                 with open(file_path, "wb") as fp:
                     pickle.dump((self.large_object, self.iter, self.a), fp)
-                return file_path
 
-            def load_checkpoint(self, path):
-                with open(path, "rb") as fp:
+            def load_checkpoint(self, checkpoint_dir):
+                file_path = os.path.join(checkpoint_dir, "model.mock")
+
+                with open(file_path, "rb") as fp:
                     self.large_object, self.iter, self.a = pickle.load(fp)
 
-        class CustomExecutor(RayTrialExecutor):
-            def save(self, *args, **kwargs):
-                checkpoint = super(CustomExecutor, self).save(*args, **kwargs)
+        class CheckObjectMemoryUsage(Callback):
+            def on_trial_save(
+                self, iteration: int, trials: List["Trial"], trial: "Trial", **info
+            ):
                 assert object_memory_usage() <= (12 * 80e6)
-                return checkpoint
 
         param_a = MockParam([1, -1])
 
@@ -101,14 +118,14 @@ class PopulationBasedTrainingMemoryTest(unittest.TestCase):
             checkpoint_config=CheckpointConfig(checkpoint_frequency=3),
             fail_fast=True,
             config={"a": tune.sample_from(lambda _: param_a())},
-            trial_executor=CustomExecutor(reuse_actors=False),
+            callbacks=[CheckObjectMemoryUsage()],
         )
 
 
 class PopulationBasedTrainingFileDescriptorTest(unittest.TestCase):
     def setUp(self):
         ray.init(num_cpus=2)
-        os.environ["TUNE_GLOBAL_CHECKPOINT_S"] = "0"
+        os.environ["TUNE_GLOBAL_CHECKPOINT_S"] = "1"
 
     def tearDown(self):
         ray.shutdown()
@@ -128,10 +145,11 @@ class PopulationBasedTrainingFileDescriptorTest(unittest.TestCase):
 
                 with open(file_path, "wb") as fp:
                     pickle.dump((self.iter, self.a), fp)
-                return file_path
 
-            def load_checkpoint(self, path):
-                with open(path, "rb") as fp:
+            def load_checkpoint(self, checkpoint_dir):
+                file_path = os.path.join(checkpoint_dir, "model.mock")
+
+                with open(file_path, "rb") as fp:
                     self.iter, self.a = pickle.load(fp)
 
         from ray.tune.callback import Callback
@@ -169,7 +187,7 @@ class PopulationBasedTrainingFileDescriptorTest(unittest.TestCase):
         )
 
         checkpoint_config = CheckpointConfig(
-            num_to_keep=1,
+            num_to_keep=3,
             checkpoint_frequency=2,
         )
 
@@ -191,32 +209,37 @@ class PopulationBasedTrainingSynchTest(unittest.TestCase):
     def setUp(self):
         ray.init(num_cpus=2)
 
-        def MockTrainingFuncSync(config, checkpoint_dir=None):
+        def train_fn_sync(config):
             iter = 0
 
-            if checkpoint_dir:
-                checkpoint_path = os.path.join(checkpoint_dir, "checkpoint")
-                with open(checkpoint_path, "rb") as fp:
-                    a, iter = pickle.load(fp)
+            checkpoint = tune.get_checkpoint()
+            if checkpoint:
+                with checkpoint.as_directory() as checkpoint_dir:
+                    checkpoint_path = os.path.join(checkpoint_dir, "checkpoint")
+                    with open(checkpoint_path, "rb") as fp:
+                        a, iter = pickle.load(fp)
 
             a = config["a"]  # Use the new hyperparameter if perturbed.
 
             while True:
                 iter += 1
-                with tune.checkpoint_dir(step=iter) as checkpoint_dir:
+                with tempfile.TemporaryDirectory() as checkpoint_dir:
                     checkpoint_path = os.path.join(checkpoint_dir, "checkpoint")
                     with open(checkpoint_path, "wb") as fp:
                         pickle.dump((a, iter), fp)
-                # Different sleep times so that asynch test runs do not
-                # randomly succeed. If well performing trials finish later,
-                # then bad performing trials will already have continued
-                # to train, which is exactly what we want to test when
-                # comparing sync vs. async.
-                time.sleep(a / 20)
-                # Score gets better every iteration.
-                tune.report(mean_accuracy=iter + a, a=a)
+                    # Different sleep times so that asynch test runs do not
+                    # randomly succeed. If well performing trials finish later,
+                    # then bad performing trials will already have continued
+                    # to train, which is exactly what we want to test when
+                    # comparing sync vs. async.
+                    time.sleep(a / 20)
+                    # Score gets better every iteration.
+                    tune.report(
+                        {"mean_accuracy": iter + a, "a": a},
+                        checkpoint=Checkpoint.from_directory(checkpoint_dir),
+                    )
 
-        self.MockTrainingFuncSync = MockTrainingFuncSync
+        self.MockTrainingFuncSync = train_fn_sync
 
     def tearDown(self):
         ray.shutdown()
@@ -303,13 +326,13 @@ class PopulationBasedTrainingSynchTest(unittest.TestCase):
                 return {"score": self.score}
 
             def save_checkpoint(self, checkpoint_dir):
-                checkpoint = Checkpoint.from_dict({"a": self.a})
-                checkpoint_path = checkpoint.to_directory(path=checkpoint_dir)
+                with open(os.path.join(checkpoint_dir, "checkpoint.json"), "w") as f:
+                    json.dump({"a": self.a}, f)
                 time.sleep(self.saving_time)
-                return checkpoint_path
 
             def load_checkpoint(self, checkpoint_dir):
-                checkpoint_dict = Checkpoint.from_directory(checkpoint_dir).to_dict()
+                with open(os.path.join(checkpoint_dir, "checkpoint.json"), "r") as f:
+                    checkpoint_dict = json.load(f)
                 self.a = checkpoint_dict["a"]
 
             def reset_config(self, new_config):
@@ -325,9 +348,7 @@ class PopulationBasedTrainingSynchTest(unittest.TestCase):
             metric="score",
             mode="max",
             perturbation_interval=perturbation_interval,
-            hyperparam_mutations={
-                "a": tune.uniform(0, 1),
-            },
+            hyperparam_mutations={"a": tune.uniform(0, 1)},
             synch=True,
         )
 
@@ -371,7 +392,8 @@ class PopulationBasedTrainingSynchTest(unittest.TestCase):
         )
         random.seed(100)
         np.random.seed(1000)
-        tuner.fit()
+        results = tuner.fit()
+        assert not results.errors
 
 
 class PopulationBasedTrainingConfigTest(unittest.TestCase):
@@ -389,7 +411,7 @@ class PopulationBasedTrainingConfigTest(unittest.TestCase):
             c2 = config["c"]["c2"]
 
             while True:
-                tune.report(mean_accuracy=a * b * (c1 + c2))
+                tune.report({"mean_accuracy": a * b * (c1 + c2)})
 
         scheduler = PopulationBasedTraining(
             time_attr="training_iteration",
@@ -447,7 +469,6 @@ class PopulationBasedTrainingResumeTest(unittest.TestCase):
                 checkpoint_path = os.path.join(tmp_checkpoint_dir, "model.mock")
                 with open(checkpoint_path, "wb") as fp:
                     pickle.dump((self.a, self.b, self.iter), fp)
-                return tmp_checkpoint_dir
 
             def load_checkpoint(self, tmp_checkpoint_dir):
                 checkpoint_path = os.path.join(tmp_checkpoint_dir, "model.mock")
@@ -469,7 +490,7 @@ class PopulationBasedTrainingResumeTest(unittest.TestCase):
         random.seed(100)
         np.random.seed(1000)
         checkpoint_config = CheckpointConfig(
-            num_to_keep=1,
+            num_to_keep=2,
             checkpoint_score_attribute="min-training_iteration",
             checkpoint_frequency=1,
             checkpoint_at_end=True,
@@ -490,23 +511,27 @@ class PopulationBasedTrainingResumeTest(unittest.TestCase):
         )
 
     def testPermutationContinuationFunc(self):
-        def MockTrainingFunc(config, checkpoint_dir=None):
+        def MockTrainingFunc(config):
             iter = 0
             a = config["a"]
             b = config["b"]
 
-            if checkpoint_dir:
-                checkpoint_path = os.path.join(checkpoint_dir, "model.mock")
-                with open(checkpoint_path, "rb") as fp:
-                    a, b, iter = pickle.load(fp)
+            if tune.get_checkpoint():
+                with tune.get_checkpoint().as_directory() as checkpoint_dir:
+                    checkpoint_path = os.path.join(checkpoint_dir, "model.mock")
+                    with open(checkpoint_path, "rb") as fp:
+                        a, b, iter = pickle.load(fp)
 
             while True:
                 iter += 1
-                with tune.checkpoint_dir(step=iter) as checkpoint_dir:
+                with tempfile.TemporaryDirectory() as checkpoint_dir:
                     checkpoint_path = os.path.join(checkpoint_dir, "model.mock")
                     with open(checkpoint_path, "wb") as fp:
                         pickle.dump((a, b, iter), fp)
-                tune.report(mean_accuracy=(a - iter) * b)
+                    tune.report(
+                        {"mean_accuracy": (a - iter) * b},
+                        checkpoint=Checkpoint.from_directory(checkpoint_dir),
+                    )
 
         scheduler = PopulationBasedTraining(
             time_attr="training_iteration",
@@ -521,7 +546,7 @@ class PopulationBasedTrainingResumeTest(unittest.TestCase):
         random.seed(100)
         np.random.seed(1000)
         checkpoint_config = CheckpointConfig(
-            num_to_keep=1,
+            num_to_keep=2,
             checkpoint_score_attribute="min-training_iteration",
         )
         tune.run(
@@ -540,7 +565,8 @@ class PopulationBasedTrainingResumeTest(unittest.TestCase):
         )
 
     def testBurnInPeriod(self):
-        runner = TrialRunner(trial_executor=MagicMock())
+        runner, *_ = create_execution_test_objects()
+        storage_context = runner._storage
 
         scheduler = PopulationBasedTraining(
             time_attr="training_iteration",
@@ -556,11 +582,7 @@ class PopulationBasedTrainingResumeTest(unittest.TestCase):
         class MockTrial(Trial):
             @property
             def checkpoint(self):
-                return _TrackedCheckpoint(
-                    dir_or_data={"data": "None"},
-                    storage_mode=CheckpointStorage.MEMORY,
-                    metrics={},
-                )
+                return Checkpoint.from_directory("dummy")
 
             @property
             def status(self):
@@ -570,20 +592,19 @@ class PopulationBasedTrainingResumeTest(unittest.TestCase):
             def status(self, status):
                 pass
 
-        trial1 = MockTrial("PPO", config=dict(num=1))
-        trial2 = MockTrial("PPO", config=dict(num=2))
-        trial3 = MockTrial("PPO", config=dict(num=3))
-        trial4 = MockTrial("PPO", config=dict(num=4))
+        register_mock_trainable()
+        trials = [
+            MockTrial(MOCK_TRAINABLE_NAME, config=dict(num=i), storage=storage_context)
+            for i in range(1, 5)
+        ]
+        trial1, trial2, trial3, trial4 = trials
 
-        runner.add_trial(trial1)
-        runner.add_trial(trial2)
-        runner.add_trial(trial3)
-        runner.add_trial(trial4)
+        for trial in trials:
+            trial.init_local_path()
+            runner.add_trial(trial)
 
-        scheduler.on_trial_add(runner, trial1)
-        scheduler.on_trial_add(runner, trial2)
-        scheduler.on_trial_add(runner, trial3)
-        scheduler.on_trial_add(runner, trial4)
+        for trial in trials:
+            scheduler.on_trial_add(runner, trial)
 
         # Add initial results.
         scheduler.on_trial_result(
@@ -636,7 +657,7 @@ class PopulationBasedTrainingResumeTest(unittest.TestCase):
         self.assertTrue(scheduler.choose_trial_to_run(runner))
 
         # Assert that trials do not hang when a terminated trial is added
-        trial5 = Trial("PPO", config=dict(num=5))
+        trial5 = Trial(MOCK_TRAINABLE_NAME, config=dict(num=5))
         runner.add_trial(trial5)
         scheduler.on_trial_add(runner, trial5)
         trial5.set_status(Trial.TERMINATED)
@@ -672,10 +693,6 @@ class PopulationBasedTrainingLoggingTest(unittest.TestCase):
         }, filtered_params
 
     def testSummarizeHyperparamChanges(self):
-        class DummyTrial:
-            def __init__(self, config):
-                self.config = config
-
         def test_config(
             hyperparam_mutations,
             old_config,
@@ -688,7 +705,7 @@ class PopulationBasedTrainingLoggingTest(unittest.TestCase):
                 resample_probability=resample_probability,
             )
             new_config, operations = scheduler._get_new_config(
-                None, DummyTrial(old_config)
+                None, DummyTrial("parent_id", config=old_config)
             )
 
             old_params = _filter_mutated_params_from_config(
@@ -793,6 +810,95 @@ class PopulationBasedTrainingLoggingTest(unittest.TestCase):
         )
 
 
+class DummyState:
+    def __init__(self, last_score):
+        self.last_score = last_score
+
+
+class PopulationBasedTrainingNanScoreTest(unittest.TestCase):
+    def test_pbt_with_nan_scores(self):
+        # Create three trials: one with nan, two with valid scores
+        t1 = DummyTrial("t1", config=MagicMock())
+        t2 = DummyTrial("t2", config=MagicMock())
+        t3 = DummyTrial("t3", config=MagicMock())
+
+        for scheduler_class in (PopulationBasedTraining, PB2):
+            # Patch _trial_state with dummy states
+            # Note: list.sort does not change the order if nan is present
+            max_states = {
+                t1: DummyState(last_score=20.0),
+                t2: DummyState(last_score=float("nan")),
+                t3: DummyState(last_score=10.0),
+            }
+            min_states = {
+                t3: DummyState(last_score=10.0),
+                t2: DummyState(last_score=float("nan")),
+                t1: DummyState(last_score=20.0),
+            }
+            with self.subTest(scheduler_class=scheduler_class.__name__):
+                if scheduler_class is PopulationBasedTraining:
+                    hp_kwargs = {"hyperparam_mutations": {"lr": [1e-4, 1e-3]}}
+                else:
+                    hp_kwargs = {"hyperparam_bounds": {"lr": [1e-4, 1e-3]}}
+                # test max mode
+                max_scheduler = scheduler_class(
+                    metric="reward",
+                    mode="max",
+                    quantile_fraction=0.5,
+                    **hp_kwargs,
+                )
+                max_scheduler._trial_state = max_states
+                for t, state in max_states.items():
+                    max_scheduler._save_trial_state(
+                        state, 100, {"reward": state.last_score, "time_total_s": 1}, t
+                    )
+
+                # Should not raise, but nan disrupts sorting
+                max_bottom, max_top = max_scheduler._quantiles()
+                max_other_trials = [
+                    t
+                    for t in max_scheduler._trial_state
+                    if t not in max_bottom + max_top
+                ]
+                max_ordered_results = [
+                    max_scheduler._trial_state[t].last_score
+                    for t in [*max_bottom, *max_other_trials, *max_top]
+                ]
+
+                self.assertIn(t1, max_top)
+                self.assertIn(t2, max_other_trials)
+                self.assertIn(t3, max_bottom)
+                self.assertEqual(max_ordered_results[-1], 20)
+
+                # Test min mode
+                min_scheduler = scheduler_class(
+                    metric="reward",
+                    mode="min",
+                    quantile_fraction=0.5,
+                    **hp_kwargs,
+                )
+                min_scheduler._trial_state = min_states
+                for t, state in min_states.items():
+                    min_scheduler._save_trial_state(
+                        state, 100, {"reward": state.last_score, "time_total_s": 1}, t
+                    )
+                min_bottom, min_top = min_scheduler._quantiles()
+                min_other_trials = [
+                    t
+                    for t in min_scheduler._trial_state
+                    if t not in min_bottom + min_top
+                ]
+                min_ordered_results = [
+                    min_scheduler._trial_state[t].last_score
+                    for t in [*min_bottom, *min_other_trials, *min_top]
+                ]
+
+                self.assertIn(t1, min_bottom)
+                self.assertIn(t2, min_other_trials)
+                self.assertIn(t3, min_top)
+                self.assertEqual(abs(min_ordered_results[-1]), 10)
+
+
 def _create_pb2_scheduler(
     metric="score",
     mode="max",
@@ -889,7 +995,11 @@ def test_pb2_nested_hyperparams():
             _save_trial_result(pb2_nested, trial_nested, t, res)
             _save_trial_result(pb2_flat, trial_flat, t, res)
 
+        # Reset seed before each _get_new_config call so both schedulers
+        # get the same random sequence in optimize_acq
+        np.random.seed(2023 + t)
         new_config, _ = pb2_nested._get_new_config(trials_nested[0], trials_nested[-1])
+        np.random.seed(2023 + t)
         new_config_flat, _ = pb2_flat._get_new_config(trials_flat[0], trials_flat[-1])
 
         # Make sure the suggested config is still nested properly

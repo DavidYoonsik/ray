@@ -12,28 +12,21 @@ ClientUnpickler loads stubs from the client and finds their associated handle
 in the server instance.
 """
 import io
-import sys
+from typing import TYPE_CHECKING, Any
+
 import ray
-
-from typing import Any
-from typing import TYPE_CHECKING
-
-from ray._private.client_mode_hook import disable_client_hook
 import ray.cloudpickle as cloudpickle
+from ray._private.client_mode_hook import disable_client_hook
 from ray.util.client.client_pickler import PickleStub
-from ray.util.client.server.server_stubs import ClientReferenceActor
-from ray.util.client.server.server_stubs import ClientReferenceFunction
+from ray.util.client.server.server_stubs import (
+    ClientReferenceActor,
+    ClientReferenceFunction,
+)
 
 if TYPE_CHECKING:
     from ray.util.client.server.server import RayletServicer
 
-if sys.version_info < (3, 8):
-    try:
-        import pickle5 as pickle  # noqa: F401
-    except ImportError:
-        import pickle  # noqa: F401
-else:
-    import pickle  # noqa: F401
+import pickle  # noqa: F401
 
 
 class ServerPickler(cloudpickle.CloudPickler):

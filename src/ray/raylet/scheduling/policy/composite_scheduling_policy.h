@@ -21,6 +21,7 @@
 #include "ray/raylet/scheduling/policy/bundle_scheduling_policy.h"
 #include "ray/raylet/scheduling/policy/hybrid_scheduling_policy.h"
 #include "ray/raylet/scheduling/policy/node_affinity_scheduling_policy.h"
+#include "ray/raylet/scheduling/policy/node_label_scheduling_policy.h"
 #include "ray/raylet/scheduling/policy/random_scheduling_policy.h"
 #include "ray/raylet/scheduling/policy/spread_scheduling_policy.h"
 
@@ -28,7 +29,7 @@ namespace ray {
 namespace raylet_scheduling_policy {
 
 /// A composite scheduling policy that routes the request to the underlining
-/// scheduling_policy according to the scheduling_type.
+/// scheduling_policy according to the scheduling_type_.
 class CompositeSchedulingPolicy : public ISchedulingPolicy {
  public:
   CompositeSchedulingPolicy(scheduling::NodeID local_node_id,
@@ -45,7 +46,10 @@ class CompositeSchedulingPolicy : public ISchedulingPolicy {
         affinity_with_bundle_policy_(local_node_id,
                                      cluster_resource_manager.GetResourceView(),
                                      is_node_available,
-                                     cluster_resource_manager.GetBundleLocationIndex()) {}
+                                     cluster_resource_manager.GetBundleLocationIndex()),
+        node_label_scheduling_policy_(local_node_id,
+                                      cluster_resource_manager.GetResourceView(),
+                                      is_node_available) {}
 
   scheduling::NodeID Schedule(const ResourceRequest &resource_request,
                               SchedulingOptions options) override;
@@ -56,10 +60,11 @@ class CompositeSchedulingPolicy : public ISchedulingPolicy {
   SpreadSchedulingPolicy spread_policy_;
   NodeAffinitySchedulingPolicy node_affinity_policy_;
   AffinityWithBundleSchedulingPolicy affinity_with_bundle_policy_;
+  NodeLabelSchedulingPolicy node_label_scheduling_policy_;
 };
 
 /// A composite scheduling policy that routes the request to the underlining
-/// bundle_scheduling_policy according to the scheduling_type.
+/// bundle_scheduling_policy according to the scheduling_type_.
 class CompositeBundleSchedulingPolicy : public IBundleSchedulingPolicy {
  public:
   explicit CompositeBundleSchedulingPolicy(

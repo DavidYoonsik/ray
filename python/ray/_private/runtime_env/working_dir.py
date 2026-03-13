@@ -1,8 +1,11 @@
 import logging
 import os
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
+import ray._private.ray_constants as ray_constants
+from ray._common.utils import try_to_create_directory
 from ray._private.runtime_env.context import RuntimeEnvContext
 from ray._private.runtime_env.packaging import (
     Protocol,
@@ -16,23 +19,33 @@ from ray._private.runtime_env.packaging import (
     upload_package_to_gcs,
 )
 from ray._private.runtime_env.plugin import RuntimeEnvPlugin
-from ray._private.utils import get_directory_size_bytes, try_to_create_directory
+from ray._private.utils import get_directory_size_bytes
+from ray._raylet import GcsClient
 from ray.exceptions import RuntimeEnvSetupError
+from ray.util.debug import log_once
 
 default_logger = logging.getLogger(__name__)
 
 _WIN32 = os.name == "nt"
+_LOG_ONCE_DEFAULT_EXCLUDE_PREFIX = "runtime_env_default_exclude:"
 
 
 def upload_working_dir_if_needed(
     runtime_env: Dict[str, Any],
+    include_gitignore: bool,
     scratch_dir: Optional[str] = os.getcwd(),
     logger: Optional[logging.Logger] = default_logger,
-    upload_fn=None,
+    upload_fn: Optional[Callable[[str, Optional[List[str]]], None]] = None,
 ) -> Dict[str, Any]:
     """Uploads the working_dir and replaces it with a URI.
 
     If the working_dir is already a URI, this is a no-op.
+
+    Excludes are combined from:
+      - .gitignore and .rayignore files in the working_dir
+      - runtime_env["excludes"] field
+      - RAY_RUNTIME_ENV_DEFAULT_EXCLUDES constant, overridable via
+        RAY_OVERRIDE_RUNTIME_ENV_DEFAULT_EXCLUDES environment variable
     """
     working_dir = runtime_env.get("working_dir")
     if working_dir is None:
@@ -58,9 +71,31 @@ def upload_working_dir_if_needed(
             raise ValueError("Only .zip files supported for remote URIs.")
         return runtime_env
 
-    excludes = runtime_env.get("excludes", None)
+    default_excludes = ray_constants.get_runtime_env_default_excludes()
+    user_excludes = runtime_env.get("excludes") or []
+    excludes = default_excludes + list(user_excludes)
+    # TODO(ricardo): 2026-01-07 Remove these warnings in a few releases. Added in
+    # case users rely on these directories being uploaded with their working_dir
+    # since this change would be difficult to debug.
+    logger = logger or default_logger
+    working_dir_path = Path(working_dir)
+    for d in default_excludes:
+        if (working_dir_path / d).exists() and log_once(
+            f"{_LOG_ONCE_DEFAULT_EXCLUDE_PREFIX}{d}"
+        ):
+            logger.warning(
+                "Directory %r is now ignored by default when packaging the working "
+                "directory. To disable this behavior, set "
+                "the `RAY_OVERRIDE_RUNTIME_ENV_DEFAULT_EXCLUDES=''` environment "
+                "variable.",
+                d,
+            )
     try:
-        working_dir_uri = get_uri_for_directory(working_dir, excludes=excludes)
+        working_dir_uri = get_uri_for_directory(
+            working_dir,
+            include_gitignore=include_gitignore,
+            excludes=excludes,
+        )
     except ValueError:  # working_dir is not a directory
         package_path = Path(working_dir)
         if not package_path.exists() or package_path.suffix != ".zip":
@@ -86,6 +121,7 @@ def upload_working_dir_if_needed(
                 working_dir,
                 include_parent_dir=False,
                 excludes=excludes,
+                include_gitignore=include_gitignore,
                 logger=logger,
             )
         except Exception as e:
@@ -119,17 +155,20 @@ class WorkingDirPlugin(RuntimeEnvPlugin):
 
     name = "working_dir"
 
-    def __init__(
-        self, resources_dir: str, gcs_aio_client: "GcsAioClient"  # noqa: F821
-    ):
+    # Note working_dir is not following the priority order of other plugins. Instead
+    # it's specially treated to happen before all other plugins.
+    priority = 5
+
+    def __init__(self, resources_dir: str, gcs_client: GcsClient):
         self._resources_dir = os.path.join(resources_dir, "working_dir_files")
-        self._gcs_aio_client = gcs_aio_client
+        self._gcs_client = gcs_client
         try_to_create_directory(self._resources_dir)
 
     def delete_uri(
         self, uri: str, logger: Optional[logging.Logger] = default_logger
     ) -> int:
         """Delete URI and return the number of bytes deleted."""
+        logger.info("Got request to delete working dir URI %s", uri)
         local_dir = get_local_dir_from_uri(uri, self._resources_dir)
         local_dir_size = get_directory_size_bytes(local_dir)
 
@@ -154,7 +193,11 @@ class WorkingDirPlugin(RuntimeEnvPlugin):
         logger: logging.Logger = default_logger,
     ) -> int:
         local_dir = await download_and_unpack_package(
-            uri, self._resources_dir, self._gcs_aio_client, logger=logger
+            uri,
+            self._resources_dir,
+            self._gcs_client,
+            logger=logger,
+            overwrite=True,
         )
         return get_directory_size_bytes(local_dir)
 
@@ -184,3 +227,38 @@ class WorkingDirPlugin(RuntimeEnvPlugin):
             # Include '/d' incase temp folder is on different drive than Ray install.
             context.command_prefix += ["cd", "/d", f"{local_dir}", "&&"]
         set_pythonpath_in_context(python_path=str(local_dir), context=context)
+
+    @contextmanager
+    def with_working_dir_env(self, uri):
+        """
+        If uri is not None, add the local working directory to the environment variable
+        as "RAY_RUNTIME_ENV_CREATE_WORKING_DIR". This is useful for other plugins to
+        create their environment with reference to the working directory. For example
+        `pip -r ${RAY_RUNTIME_ENV_CREATE_WORKING_DIR}/requirements.txt`
+
+        The environment variable is removed after the context manager exits.
+        """
+        if uri is None:
+            yield
+        else:
+            local_dir = get_local_dir_from_uri(uri, self._resources_dir)
+            if not local_dir.exists():
+                raise ValueError(
+                    f"Local directory {local_dir} for URI {uri} does "
+                    "not exist on the cluster. Something may have gone wrong while "
+                    "downloading or unpacking the working_dir."
+                )
+            key = ray_constants.RAY_RUNTIME_ENV_CREATE_WORKING_DIR_ENV_VAR
+            prev = os.environ.get(key)
+            # Windows backslash paths are weird. When it's passed to the env var, and
+            # when Pip expands it, the backslashes are interpreted as escape characters
+            # and messes up the whole path. So we convert it to forward slashes.
+            # This works at least for all Python applications, including pip.
+            os.environ[key] = local_dir.as_posix()
+            try:
+                yield
+            finally:
+                if prev is None:
+                    del os.environ[key]
+                else:
+                    os.environ[key] = prev

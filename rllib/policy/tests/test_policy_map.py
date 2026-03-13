@@ -1,7 +1,8 @@
-import gymnasium as gym
-import numpy as np
 import time
 import unittest
+
+import gymnasium as gym
+import numpy as np
 
 import ray
 from ray.rllib.algorithms.ppo import PPOConfig, PPOTF2Policy
@@ -25,9 +26,11 @@ class TestPolicyMap(unittest.TestCase):
         # for this test for now.
         config = (
             PPOConfig()
+            .api_stack(
+                enable_env_runner_and_connector_v2=False,
+                enable_rl_module_and_learner=False,
+            )
             .framework("tf2")
-            .rl_module(_enable_rl_module_api=False)
-            .training(_enable_learner_api=False)
         )
         obs_space = gym.spaces.Box(-1.0, 1.0, (4,), dtype=np.float32)
         dummy_obs = obs_space.sample()
@@ -117,7 +120,8 @@ class TestPolicyMap(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    import pytest
     import sys
+
+    import pytest
 
     sys.exit(pytest.main(["-v", __file__]))

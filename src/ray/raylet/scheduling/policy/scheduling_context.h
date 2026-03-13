@@ -14,9 +14,6 @@
 
 #pragma once
 
-#include "absl/container/flat_hash_map.h"
-#include "ray/common/bundle_location_index.h"
-#include "ray/common/bundle_spec.h"
 #include "ray/common/id.h"
 #include "ray/common/placement_group.h"
 
@@ -31,11 +28,11 @@ struct SchedulingContext {
 struct BundleSchedulingContext : public SchedulingContext {
  public:
   explicit BundleSchedulingContext(
-      absl::optional<std::shared_ptr<BundleLocations>> bundle_locations)
+      std::optional<std::shared_ptr<BundleLocations>> bundle_locations)
       : bundle_locations_(std::move(bundle_locations)) {}
 
   /// The locations of existing bundles for this placement group.
-  absl::optional<std::shared_ptr<BundleLocations>> bundle_locations_;
+  std::optional<std::shared_ptr<BundleLocations>> bundle_locations_;
 };
 
 struct AffinityWithBundleSchedulingContext : public SchedulingContext {
@@ -46,6 +43,18 @@ struct AffinityWithBundleSchedulingContext : public SchedulingContext {
 
  private:
   BundleID affinity_bundle_id_;
+};
+
+struct NodeLabelSchedulingContext : public SchedulingContext {
+ public:
+  explicit NodeLabelSchedulingContext(const rpc::SchedulingStrategy &scheduling_strategy)
+      : scheduling_strategy_(scheduling_strategy) {}
+  const rpc::SchedulingStrategy &GetSchedulingStrategy() const {
+    return scheduling_strategy_;
+  }
+
+ private:
+  rpc::SchedulingStrategy scheduling_strategy_;
 };
 
 }  // namespace raylet_scheduling_policy

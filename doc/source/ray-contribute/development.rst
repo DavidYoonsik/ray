@@ -1,116 +1,85 @@
 .. _building-ray:
 
-Building Ray from Source
+Building Ray from source
 =========================
 
-For a majority of Ray users, installing Ray via the latest wheels or pip package is usually enough. However, you may want to build the latest master branch.
+To contribute to the Ray repository, follow the instructions below to build from the latest master branch.
 
-.. tip::
+Depending on your goal, you may not need all sections on this page:
 
-  If you are only editing Python files, follow instructions for :ref:`python-develop` to avoid long build times.
+- **Python-only development (fast loop, no C++)** - edit Python files without compiling C++ (see :ref:`python-develop`).
+- **Build Ray with C++** - choose one:
 
-  If you already followed the instructions in :ref:`python-develop` and want to switch to the Full build in this section, you will need to first uninstall.
+  - **Distributable manylinux wheel** - uses a manylinux build container to produce a ``.whl`` file for installation on a cluster, for testing the packaged artifact locally, or for sharing (see :ref:`build-distributable-wheel`).
+  - **Ray image** - build a nightly-style ``rayproject/ray`` or ``rayproject/ray-llm`` image (see :ref:`build-ray-image`).
+  - **Full source build (editable install)** - make C++ changes or build all of Ray (see :ref:`full-source-build`).
 
 .. contents::
   :local:
+  :backlinks: none
 
-Clone the repository
---------------------
+Setup
+------------------
 
-To build Ray locally you will need to have the Git repository, so first, fork it on GitHub. Then you can clone it to your machine:
+.. _fork-ray-repo:
 
-.. tab-set::
+Fork the Ray repository
+~~~~~~~~~~~~~~~~~~~~~~~
 
-    .. tab-item:: Git SSH
+Forking an open source repository is a best practice when looking to contribute, as it allows you to make and test changes without affecting the original project, ensuring a clean and organized collaboration process.
+You can propose changes to the main project by submitting a pull request to the main project's repository.
 
-        To clone the repository using Git with SSH (the default) run:
+1. Navigate to the `Ray GitHub repository <https://github.com/ray-project/ray>`_.
+2. Follow these `GitHub instructions <https://docs.github.com/en/get-started/quickstart/fork-a-repo>`_, and do the following:
 
-        .. code-block:: shell
+    a. `Fork the repo <https://docs.github.com/en/get-started/quickstart/fork-a-repo#forking-a-repository>`_ using your preferred method.
+    b. `Clone <https://docs.github.com/en/get-started/quickstart/fork-a-repo#cloning-your-forked-repository>`_ to your local machine.
+    c. `Connect your repo <https://docs.github.com/en/get-started/quickstart/fork-a-repo#configuring-git-to-sync-your-fork-with-the-upstream-repository>`_ to the upstream (main project) Ray repo to sync changes.
 
-            git clone git@github.com:[your username]/ray.git
 
-    .. tab-item:: Git HTTPS
+.. _prepare-venv:
 
-        To clone the repository using Git with HTTPS run:
+Prepare a Python virtual environment
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-        .. code-block:: shell
+Skip this section if you're building a :ref:`distributable wheel <build-distributable-wheel>` or a :ref:`Ray image <build-ray-image>`.
 
-            git clone https://github.com/[your username]/ray.git
-
-Then you can enter into the Ray git repository directory:
-
-.. code-block:: shell
-
-    cd ray
-
-Next make sure you connect your repository to the upstream (main project) Ray repository. This will allow you to push your code to your repository when proposing changes (in pull requests) while also pulling updates from the main project.
-
-.. tab-set::
-
-    .. tab-item:: Git SSH
-
-        To connect your repository using SSH (the default) run the command:
-
-        .. code-block:: shell
-
-            git remote add upstream git@github.com:ray-project/ray.git
-
-    .. tab-item:: Git HTTPS
-
-        To connect your repository using HTTPS run the command:
-
-        .. code-block:: shell
-
-            git remote add upstream https://github.com/ray-project/ray.git
-
-Every time you want to update your local version you can pull the changes from the main repository:
-
-.. code-block:: shell
-
-    # Checkout the local master branch
-    git checkout master
-    # Pull the latest changes from the main repository
-    git pull upstream master
-
-Prepare the Python environment
-------------------------------
-
-You probably want some type of Python virtual environment. For example, you can use Anaconda's ``conda``.
+Create a virtual environment to prevent version conflicts and to develop with an isolated, project-specific Python setup.
 
 .. tab-set::
 
     .. tab-item:: conda
 
-        Set up a ``conda`` environment named ``ray``:
+        Set up a ``conda`` environment named ``myenv``:
 
         .. code-block:: shell
 
-            conda create -c conda-forge python=3.9 -n ray
+            conda create -c conda-forge python=3.10 -n myenv
 
 
         Activate your virtual environment to tell the shell/terminal to use this particular Python:
 
         .. code-block:: shell
 
-            conda activate ray
+            conda activate myenv
 
         You need to activate the virtual environment every time you start a new shell/terminal to work on Ray.
 
     .. tab-item:: venv
 
-        Use Python's integrated ``venv`` module to create a virtual environment called ``venv`` in the current directory:
+        Use Python's integrated ``venv`` module to create a virtual environment called ``myenv`` in the current directory:
 
         .. code-block:: shell
 
-            python -m venv venv
+            python -m venv myenv
 
         This contains a directory with all the packages used by the local Python of your project. You only need to do this step once.
 
-        Activate your virtual environment to tell the  shell/terminal to use this particular Python:
+        Activate your virtual environment to tell the shell/terminal to use this particular Python:
 
         .. code-block:: shell
 
-            source venv/bin/activate
+            source myenv/bin/activate
 
         You need to activate the virtual environment every time you start a new shell/terminal to work on Ray.
 
@@ -122,25 +91,25 @@ You probably want some type of Python virtual environment. For example, you can 
 
 .. _python-develop:
 
-Building Ray (Python Only)
+Building Ray (Python only)
 --------------------------
 
 .. note:: Unless otherwise stated, directory and file paths are relative to the project root directory.
 
-RLlib, Tune, Autoscaler, and most Python files do not require you to build and compile Ray. Follow these instructions to develop Ray's Python files locally without building Ray.
+RLlib, Tune, Autoscaler, and most Python files don't require you to build and compile Ray. Follow these instructions to develop Ray's Python files locally without building Ray.
 
-1. Make sure you have a clone of Ray's git repository as explained above.
+1. Make sure you have a clone of Ray's git repository (see :ref:`fork-ray-repo`).
 
-2. Make sure you activate the Python (virtual) environment as described above.
+2. Make sure you activate the Python (virtual) environment (see :ref:`prepare-venv`).
 
 3. Pip install the **latest Ray wheels.** See :ref:`install-nightlies` for instructions.
 
 .. code-block:: shell
 
-    # For example, for Python 3.8:
-    pip install -U https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-3.0.0.dev0-cp38-cp38-manylinux2014_x86_64.whl
+    # For example, for Python 3.10:
+    pip install -U https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-3.0.0.dev0-cp310-cp310-manylinux2014_x86_64.whl
 
-4. Replace Python files in the installed package with your local editable copy. We provide a simple script to help you do this: ``python python/ray/setup-dev.py``. Running the script will remove the  ``ray/tune``, ``ray/rllib``, ``ray/autoscaler`` dir (among other directories) bundled with the ``ray`` pip package, and replace them with links to your local code. This way, changing files in your git clone will directly affect the behavior of your installed Ray.
+4. Replace Python files in the installed package with your local editable copy. Use the script ``python python/ray/setup-dev.py`` to do this. The script removes the ``ray/tune``, ``ray/rllib``, ``ray/autoscaler`` directories (among others) bundled with the ``ray`` pip package, replacing them with links to your local code. This way, changing files in your git clone directly affects the behavior of your installed Ray.
 
 .. code-block:: shell
 
@@ -148,14 +117,16 @@ RLlib, Tune, Autoscaler, and most Python files do not require you to build and c
     # with your local `ray/python/ray/<package>`.
     python python/ray/setup-dev.py
 
-.. note:: [Advanced] You can also optionally skip creating symbolic link for directories of your choice.
+You can optionally skip creating symbolic links for specific directories:
 
 .. code-block:: shell
 
     # This links all folders except "_private" and "dashboard" without user prompt.
-    python setup-dev.py -y --skip _private dashboard
+    python python/ray/setup-dev.py -y --skip _private dashboard
 
-.. warning:: Do not run ``pip uninstall ray`` or ``pip install -U`` (for Ray or Ray wheels) if setting up your environment this way. To uninstall or upgrade, you must first ``rm -rf`` the pip-installation site (usually a directory at the ``site-packages/ray`` location), then do a pip reinstall (see the command above), and finally run the above ``setup-dev.py`` script again.
+.. _python-develop-uninstall:
+
+.. warning:: Don't run ``pip uninstall ray`` or ``pip install -U`` (for Ray or Ray wheels) if setting up your environment this way. To uninstall or upgrade, first ``rm -rf`` the pip-installation site (usually a directory at the ``site-packages/ray`` location), then do a pip reinstall (see the command above), and finally run the ``setup-dev.py`` script again.
 
 .. code-block:: shell
 
@@ -163,31 +134,99 @@ RLlib, Tune, Autoscaler, and most Python files do not require you to build and c
     rm -rf <package path>/site-packages/ray # Path will be in the output of `setup-dev.py`.
     pip uninstall ray # or `pip install -U <wheel>`
 
-Preparing to build Ray on Linux
--------------------------------
+.. _build-distributable-wheel:
 
-.. tip:: If you are only editing Tune/RLlib/Autoscaler files, follow instructions for :ref:`python-develop` to avoid long build times.
+Building distributable manylinux wheels
+----------------------------------------
+
+.. dropdown:: Setup
+  :open:
+
+  Before you begin, make sure you have:
+
+  - A clone of the Ray repository (see :ref:`fork-ray-repo`)
+  - `uv <https://docs.astral.sh/uv/>`_ installed
+  - `Docker <https://docs.docker.com/get-docker/>`_ installed
+
+To build a distributable manylinux ``.whl``, use the ``build-wheel.sh``
+script at the repository root.
+
+.. code-block:: bash
+
+  # Build a manylinux wheel for the host architecture:
+  ./build-wheel.sh 3.12
+
+  # Specify a custom output directory:
+  ./build-wheel.sh 3.12 ./dist
+
+Run ``./build-wheel.sh`` without arguments to see supported Python versions and options.
+Regardless of host OS, the output is always a manylinux wheel (the same format used by CI
+and PyPI). Supported build hosts are Linux x86_64, Linux aarch64, and macOS ARM64.
+
+See ``python/README-building-wheels.md`` for additional options, including building
+manylinux wheels directly with Docker.
+
+.. _build-ray-image:
+
+Building Ray images
+--------------------------
+
+.. dropdown:: Setup
+  :open:
+
+  Before you begin, make sure you have:
+
+  - A clone of the Ray repository (see :ref:`fork-ray-repo`)
+  - `uv <https://docs.astral.sh/uv/>`_ installed
+  - `Docker <https://docs.docker.com/get-docker/>`_ installed
+
+To build a Ray image, use the ``build-image.sh`` script at the repository root.
+
+.. code-block:: bash
+
+  # Build the default Ray image:
+  ./build-image.sh ray
+
+  # Build with a specific Python version:
+  ./build-image.sh ray -p 3.12
+
+  # Build a GPU image:
+  ./build-image.sh ray --platform cu12.8.1-cudnn
+
+Run ``./build-image.sh --help`` to see available image types, Python versions, and platform variants.
+
+
+.. _full-source-build:
+
+Full source build
+-----------------
+
+.. tip::
+
+  If you already followed the instructions in :ref:`python-develop` and want to switch
+  to the Full build, you need to first uninstall Ray (see :ref:`uninstallation steps <python-develop-uninstall>`).
+
+Preparing to build Ray on Linux
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. tip:: If you're only editing Tune/RLlib/Autoscaler files, follow :ref:`python-develop` instead to avoid long build times.
 
 To build Ray on Ubuntu, run the following commands:
 
 .. code-block:: bash
 
-  # Add a PPA containing gcc-9 for older versions of Ubuntu.
-  sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
   sudo apt-get update
-  sudo apt-get install -y build-essential curl gcc-9 g++-9 pkg-config psmisc unzip
-  sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-9 90 \
-                --slave /usr/bin/g++ g++ /usr/bin/g++-9 \
-                --slave /usr/bin/gcov gcov /usr/bin/gcov-9
+  sudo apt-get install -y build-essential curl clang-12 pkg-config psmisc unzip
 
-  # Install Bazel.
+  # Install Bazelisk.
   ci/env/install-bazel.sh
 
   # Install node version manager and node 14
-  $(curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh)
+  curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
   nvm install 14
   nvm use 14
 
+The ``install-bazel.sh`` script installs ``bazelisk``. Note that ``bazel`` is installed at ``$HOME/bin/bazel``; make sure it's on your ``PATH``. If you prefer to use ``bazel`` directly, only version ``6.5.0`` is currently supported.
 
 For RHELv8 (Redhat EL 8.0-64 Minimal), run the following commands:
 
@@ -196,14 +235,14 @@ For RHELv8 (Redhat EL 8.0-64 Minimal), run the following commands:
   sudo yum groupinstall 'Development Tools'
   sudo yum install psmisc
 
-In RedHat, install Bazel manually from this link: https://docs.bazel.build/versions/main/install-redhat.html
+In RedHat, install Bazel manually from this link: https://bazel.build/versions/6.5.0/install/redhat
 
-Preparing to build Ray on MacOS
--------------------------------
+Preparing to build Ray on macOS
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. tip:: Assuming you already have Brew and Bazel installed on your mac and you also have grpc and protobuf installed on your mac consider removing those (grpc and protobuf) for smooth build through the commands ``brew uninstall grpc``, ``brew uninstall protobuf``. If you have built the source code earlier and it still fails with errors like ``No such file or directory:``, try cleaning previous builds on your host by running the commands ``brew uninstall binutils`` and ``bazel clean --expunge``.
+If you have grpc or protobuf installed, remove them first for a smooth build: ``brew uninstall grpc``, ``brew uninstall protobuf``. If the build fails with ``No such file or directory`` errors, clean previous builds with ``brew uninstall binutils`` and ``bazel clean --expunge``.
 
-To build Ray on MacOS, first install these dependencies:
+To build Ray on macOS, first install these dependencies:
 
 .. code-block:: bash
 
@@ -211,40 +250,40 @@ To build Ray on MacOS, first install these dependencies:
   brew install wget
 
   # Install Bazel.
-  ray/ci/env/install-bazel.sh
+  ci/env/install-bazel.sh
 
-Building Ray on Linux & MacOS (full)
-------------------------------------
+Building Ray on Linux & macOS (full)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Make sure you have a local clone of Ray's git repository as explained above. You will also need to install NodeJS_ to build the dashboard.
+Make sure you have a local clone of Ray's git repository (see :ref:`fork-ray-repo`). You also need to install NodeJS_ to build the dashboard.
 
 Enter into the project directory, for example:
 
 .. code-block:: shell
 
-    cd ray
+  cd ray
 
-Now you can build the dashboard. From inside of your local Ray project directory enter into the dashboard client directory:
+Build the dashboard. From inside your local Ray project directory, enter the dashboard client directory:
 
 .. code-block:: bash
 
-  cd dashboard/client
+  cd python/ray/dashboard/client
 
-Then you can install the dependencies and build the dashboard:
+Install the dependencies and build the dashboard:
 
 .. code-block:: bash
 
   npm ci
   npm run build
 
-After that, you can now move back to the top level Ray directory:
+Move back to the top-level Ray directory:
 
 .. code-block:: shell
 
-  cd ../..
+  cd -
 
 
-Now let's build Ray for Python. Make sure you activate any Python virtual (or conda) environment you could be using as described above.
+Now let's build Ray for Python. Make sure you activate any Python virtual (or conda) environment (see :ref:`prepare-venv`).
 
 Enter into the ``python/`` directory inside of the Ray project directory and install the project with ``pip``:
 
@@ -252,38 +291,42 @@ Enter into the ``python/`` directory inside of the Ray project directory and ins
 
   # Install Ray.
   cd python/
-  # You may need to set the following two env vars if your platform is MacOS ARM64(M1).
+  # Install required dependencies.
+  pip install -r requirements.txt
+  # You may need to set the following two env vars if you have a macOS ARM64(M1) platform.
   # See https://github.com/grpc/grpc/issues/25082 for more details.
   # export GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1
   # export GRPC_PYTHON_BUILD_SYSTEM_ZLIB=1
   pip install -e . --verbose  # Add --user if you see a permission denied error.
 
 The ``-e`` means "editable", so changes you make to files in the Ray
-directory will take effect without reinstalling the package.
+directory take effect without reinstalling the package.
 
-.. warning:: if you run ``python setup.py install``, files will be copied from the Ray directory to a directory of Python packages (``/lib/python3.6/site-packages/ray``). This means that changes you make to files in the Ray directory will not have any effect.
+.. warning:: Don't run ``python setup.py install`` — Python copies files from the Ray directory to a packages directory (``/lib/python3.6/site-packages/ray``), so changes you make to files in the Ray directory won't have any effect.
 
-.. tip::
+If your machine runs out of memory during the build, add the following to ``~/.bazelrc``:
 
-  If your machine is running out of memory during the build or the build is causing other programs to crash, try adding the following line to ``~/.bazelrc``:
+  .. code-block:: shell
 
-  ``build --local_ram_resources=HOST_RAM*.5 --local_cpu_resources=4``
+    build --local_ram_resources=HOST_RAM*.5 --local_cpu_resources=4
 
-  The ``build --disk_cache=~/bazel-cache`` option can be useful to speed up repeated builds too.
+  The ``build --disk_cache=~/bazel-cache`` option can also speed up repeated builds.
+
+If you run into an error building protobuf, switching from miniforge to anaconda might help.
 
 .. _NodeJS: https://nodejs.org
 
 Building Ray on Windows (full)
-------------------------------
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 **Requirements**
 
-The following links were correct during the writing of this section. In case the URLs changed, search at the organizations' sites.
+The following links were accurate at the time of writing. If a URL has changed, search the organization's site.
 
-- Bazel 4.2 (https://github.com/bazelbuild/bazel/releases/tag/4.2.1)
+- Bazel 6.5.0 (https://github.com/bazelbuild/bazel/releases/tag/6.5.0)
 - Microsoft Visual Studio 2019 (or Microsoft Build Tools 2019 - https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2019)
 - JDK 15 (https://www.oracle.com/java/technologies/javase-jdk15-downloads.html)
-- Miniconda 3 (https://docs.conda.io/en/latest/miniconda.html)
+- Miniforge 3 (https://github.com/conda-forge/miniforge/blob/main/README.md)
 - git for Windows, version 2.31.1 or later (https://git-scm.com/download/win)
 
 You can also use the included script to install Bazel:
@@ -304,18 +347,18 @@ You can also use the included script to install Bazel:
    3. Go to "For Developers" on the left pane;
    4. Turn on "Developer mode".
 
-2. Add the following Miniconda subdirectories to PATH. If Miniconda was installed for all users, the following paths are correct. If Miniconda is installed for a single user, adjust the paths accordingly.
+2. Add the following Miniforge subdirectories to PATH. If Miniforge was installed for all users, the following paths are correct. If Miniforge is installed for a single user, adjust the paths accordingly.
 
-   - ``C:\ProgramData\Miniconda3``
-   - ``C:\ProgramData\Miniconda3\Scripts``
-   - ``C:\ProgramData\Miniconda3\Library\bin``
+   - ``C:\ProgramData\miniforge3``
+   - ``C:\ProgramData\miniforge3\Scripts``
+   - ``C:\ProgramData\miniforge3\Library\bin``
 
 3. Define an environment variable ``BAZEL_SH`` to point to ``bash.exe``. If git for Windows was installed for all users, bash's path should be ``C:\Program Files\Git\bin\bash.exe``. If git was installed for a single user, adjust the path accordingly.
 
-4. Bazel 4.2 installation. Go to Bazel 4.2 release web page and download
-bazel-4.2.1-windows-x86_64.exe. Copy the exe into the directory of your choice.
-Define an environment variable BAZEL_PATH to full exe path (example:
-``set BAZEL_PATH=C:\bazel\bazel.exe``). Also add the Bazel directory to the
+4. Install Bazel 6.5.0. Go to the Bazel 6.5.0 release page and download
+``bazel-6.5.0-windows-x86_64.exe``. Copy the exe into the directory of your choice.
+Define an environment variable ``BAZEL_PATH`` to the full exe path (example:
+``set BAZEL_PATH=C:\bazel\bazel.exe``). Also add the Bazel directory to
 ``PATH`` (example: ``set PATH=%PATH%;C:\bazel``)
 
 5. Download ray source code and build it.
@@ -327,63 +370,52 @@ Define an environment variable BAZEL_PATH to full exe path (example:
   cd ray\python
   pip install -e . --verbose
 
+Advanced build options
+----------------------
+
 Environment variables that influence builds
---------------------------------------------
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 You can tweak the build with the following environment variables (when running ``pip install -e .`` or ``python setup.py install``):
 
-- ``RAY_INSTALL_JAVA``: If set and equal to ``1``, extra build steps will be executed
-  to build java portions of the codebase
-- ``RAY_INSTALL_CPP``: If set and equal to ``1``, ``ray-cpp`` will be installed
-- ``RAY_DISABLE_EXTRA_CPP``: If set and equal to ``1``, a regular (non -
-  ``cpp``) build will not provide some ``cpp`` interfaces
-- ``SKIP_BAZEL_BUILD``: If set and equal to ``1``, no Bazel build steps will be
-  executed
-- ``SKIP_THIRDPARTY_INSTALL``: If set will skip installation of third-party
-  python packages
-- ``RAY_DEBUG_BUILD``: Can be set to ``debug``, ``asan``, or ``tsan``. Any
-  other value will be ignored
+- ``RAY_BUILD_CORE``: If set and equal to ``1``, Ray builds the core parts. Defaults to ``1``.
+- ``RAY_INSTALL_JAVA``: If set and equal to ``1``, Ray runs extra build steps
+  to build Java portions of the codebase
+- ``RAY_INSTALL_CPP``: If set and equal to ``1``, Ray installs ``ray-cpp``
+- ``RAY_BUILD_REDIS``: If set and equal to ``1``, Ray builds or fetches Redis binaries.
+  These binaries are only used for testing. Defaults to ``1``.
+- ``RAY_DISABLE_EXTRA_CPP``: If set and equal to ``1``, a regular (non-``cpp``)
+  build won't provide some ``cpp`` interfaces
+- ``SKIP_BAZEL_BUILD``: If set and equal to ``1``, Ray skips all Bazel build steps
+- ``SKIP_THIRDPARTY_INSTALL_CONDA_FORGE``: If set, setup skips installation of
+  third-party packages required for build. This is active on conda-forge where
+  pip isn't used to create a build environment.
+- ``RAY_DEBUG_BUILD``: Can be set to ``debug``, ``asan``, or ``tsan``. Ray ignores
+  any other value
 - ``BAZEL_ARGS``: If set, pass a space-separated set of arguments to Bazel. This can be useful
   for restricting resource usage during builds, for example. See https://bazel.build/docs/user-manual
   for more information about valid arguments.
-- ``IS_AUTOMATED_BUILD``: Used in CI to tweak the build for the CI machines
+- ``IS_AUTOMATED_BUILD``: Used in conda-forge CI to tweak the build for the managed CI machines
 - ``SRC_DIR``: Can be set to the root of the source checkout, defaults to
   ``None`` which is ``cwd()``
 - ``BAZEL_SH``: used on Windows to find a ``bash.exe``, see below
 - ``BAZEL_PATH``: used on Windows to find ``bazel.exe``, see below
 - ``MINGW_DIR``: used on Windows to find ``bazel.exe`` if not found in ``BAZEL_PATH``
 
-Installing additional dependencies for development
---------------------------------------------------
+Fast, debug, and optimized builds
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Dependencies for the linter (``scripts/format.sh``) can be installed with:
-
-.. code-block:: shell
-
- pip install -r python/requirements/lint-requirements.txt
-
-Dependencies for running Ray unit tests under ``python/ray/tests`` can be installed with:
-
-.. code-block:: shell
-
- pip install -c python/requirements.txt -r python/requirements/test-requirements.txt
-
-Requirement files for running Ray Data / ML library tests are under ``python/requirements/``.
-
-Fast, Debug, and Optimized Builds
----------------------------------
-
-Currently, Ray is built with optimizations, which can take a long time and
-interfere with debugging. To perform fast, debug, or optimized builds, you can
+By default, Ray builds with optimizations, which can take a long time and
+interfere with debugging. To perform fast, debug, or optimized builds,
 run the following (via ``-c`` ``fastbuild``/``dbg``/``opt``, respectively):
 
 .. code-block:: shell
 
- bazel build -c fastbuild //:ray_pkg
+ bazel run -c fastbuild //:gen_ray_pkg
 
-This will rebuild Ray with the appropriate options (which may take a while).
-If you need to build all targets, you can use ``"//:all"`` instead of
-``//:ray_pkg``.
+This rebuilds Ray with the appropriate options (which might take a while).
+If you need to build all targets, use ``bazel build //:all`` instead of
+``bazel run //:gen_ray_pkg``.
 
 To make this change permanent, you can add an option such as the following
 line to your user-level ``~/.bazelrc`` file (not to be confused with the
@@ -399,15 +431,8 @@ all of your development in the future.
 Using ``dbg`` instead of ``fastbuild`` generates more debug information,
 which can make it easier to debug with a debugger like ``gdb``.
 
-Building the Docs
------------------
-
-To learn more about building the docs refer to `Contributing to the Ray Documentation`_.
-
-.. _Contributing to the Ray Documentation: https://docs.ray.io/en/master/ray-contribute/docs.html
-
 Using a local repository for dependencies
------------------------------------------
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 If you'd like to build Ray with custom dependencies (for example, with a
 different version of Cython), you can modify your ``.bzl`` file as follows:
@@ -433,6 +458,60 @@ To test switching back to the original rule, change ``False`` to ``True``.
 
 .. _`PR template`: https://github.com/ray-project/ray/blob/master/.github/PULL_REQUEST_TEMPLATE.md
 
+Development tooling
+-------------------
+
+Installing additional dependencies for development
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Install dependencies for the linter (``pre-commit``):
+
+.. code-block:: shell
+
+  pip install -c python/requirements_compiled.txt pre-commit
+  pre-commit install
+
+Install dependencies for running Ray unit tests under ``python/ray/tests``:
+
+.. code-block:: shell
+
+ pip install -c python/requirements_compiled.txt -r python/requirements/test-requirements.txt
+
+Requirement files for running Ray Data / ML library tests are under ``python/requirements/``.
+
+Pre-commit hooks
+~~~~~~~~~~~~~~~~
+
+Ray uses pre-commit hooks with `the pre-commit python package <https://pre-commit.com/>`_.
+The ``.pre-commit-config.yaml`` file configures all the linting and formatting checks.
+To start using ``pre-commit``:
+
+.. code-block:: shell
+
+   pip install pre-commit
+   pre-commit install
+
+This installs pre-commit into the current environment and enables pre-commit checks every time
+you commit new code changes with git. To temporarily skip pre-commit checks, use the ``-n`` or
+``--no-verify`` flag when committing:
+
+.. code-block:: shell
+
+   git commit -n
+
+If you encounter any issues with ``pre-commit``, please `report an issue here`_.
+
+.. _report an issue here: https://github.com/ray-project/ray/issues/new?template=bug-report.yml
+
+
+Building the docs
+-----------------
+
+To learn more about building the docs refer to `Contributing to the Ray Documentation`_.
+
+.. _Contributing to the Ray Documentation: https://docs.ray.io/en/master/ray-contribute/docs.html
+
+
 Troubleshooting
 ---------------
 
@@ -455,9 +534,9 @@ in this error:
       from . import _psutil_osx as cext
   ImportError: cannot import name '_psutil_osx' from partially initialized module 'psutil' (most likely due to a circular import) (.../ray/python/ray/thirdparty_files/psutil/__init__.py)
 
-Then you should run the following commands:
+Run the following commands:
 
 .. code-block:: bash
 
   rm -rf python/ray/thirdparty_files/
-  python3 -m pip install setproctitle
+  python3 -m pip install psutil

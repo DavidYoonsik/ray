@@ -17,22 +17,25 @@
 #include <gtest/gtest_prod.h>
 
 #include <iostream>
+#include <memory>
 #include <sstream>
+#include <string>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
-#include "absl/container/flat_hash_set.h"
 #include "ray/common/bundle_location_index.h"
 #include "ray/common/scheduling/cluster_resource_data.h"
 #include "ray/common/scheduling/fixed_point.h"
+#include "ray/observability/metric_interface.h"
+#include "ray/raylet/metrics.h"
 #include "ray/raylet/scheduling/local_resource_manager.h"
+#include "ray/util/container_util.h"
 #include "ray/util/logging.h"
 #include "src/ray/protobuf/gcs.pb.h"
 
 namespace ray {
-class GcsMonitorServerTest;
 namespace raylet {
-class ClusterTaskManagerTest;
+class ClusterLeaseManagerTest;
 class SchedulingPolicyTest;
 }  // namespace raylet
 namespace raylet_scheduling_policy {
@@ -51,11 +54,12 @@ class ClusterResourceManager {
   /// Get the resource view of the cluster.
   const absl::flat_hash_map<scheduling::NodeID, Node> &GetResourceView() const;
 
-  /// Update node resources. This hanppens when a node resource usage udpated.
+  /// Update node resources. This happens when a node resource usage updated.
   ///
-  /// \param node_id ID of the node which resoruces need to be udpated.
-  /// \param resource_data The node resource data.
-  bool UpdateNode(scheduling::NodeID node_id, const rpc::ResourcesData &resource_data);
+  /// \param node_id ID of the node which resources need to be updated.
+  /// \param resource_view_sync_message The node resource usage data.
+  bool UpdateNode(scheduling::NodeID node_id,
+                  const syncer::ResourceViewSyncMessage &resource_view_sync_message);
 
   /// Remove node from the cluster data structure. This happens
   /// when a node fails or it is removed from the cluster.
@@ -94,29 +98,23 @@ class ClusterResourceManager {
   bool SubtractNodeAvailableResources(scheduling::NodeID node_id,
                                       const ResourceRequest &resource_request);
 
-  /// Check if we have sufficient resource to fullfill resource request for an given node.
+  /// Check if we have available resources to fullfill resource request for an given node.
   ///
   /// \param node_id: the id of the node.
   /// \param resource_request: the request we want to check.
   /// \param ignore_object_store_memory_requirement: if true, we will ignore the
   ///  require_object_store_memory in the resource_request.
-  bool HasSufficientResource(scheduling::NodeID node_id,
+  bool HasAvailableResources(scheduling::NodeID node_id,
                              const ResourceRequest &resource_request,
                              bool ignore_object_store_memory_requirement) const;
+
+  bool HasFeasibleResources(scheduling::NodeID node_id,
+                            const ResourceRequest &resource_request) const;
 
   /// Add available resource to a given node.
   /// Return false if such node doesn't exist.
   bool AddNodeAvailableResources(scheduling::NodeID node_id,
-                                 const ResourceRequest &resource_request);
-
-  /// Update node available resources.
-  /// NOTE: This method only updates the existing resources of the node, and the
-  /// nonexistent resources will be filtered out, whitch is different from `UpdateNode`.
-  /// Return false if such node doesn't exist.
-  /// TODO(Shanly): This method will be replaced with UpdateNode once we have resource
-  /// version.
-  bool UpdateNodeAvailableResourcesIfExist(scheduling::NodeID node_id,
-                                           const rpc::ResourcesData &resource_data);
+                                 const ResourceSet &resource_set);
 
   /// Update node normal task resources.
   /// Return false if such node doesn't exist.
@@ -129,12 +127,35 @@ class ClusterResourceManager {
     return nodes_.count(node_id) > 0;
   }
 
-  void DebugString(std::stringstream &buffer) const;
+  bool IsNodeDraining(const scheduling::NodeID &node_id) const {
+    const auto &node = map_find_or_die(nodes_, node_id);
+    return node.GetLocalView().is_draining;
+  }
+
+  /// Set the draining state of a node.
+  /// This is called when the autoscaler commits to draining a node, ensuring
+  /// the scheduler immediately sees the node as unavailable for scheduling.
+  ///
+  /// \param node_id The ID of the node.
+  /// \param is_draining Whether the node is draining.
+  /// \param draining_deadline_timestamp_ms The deadline for the drain operation.
+  /// \return true if the node exists and was updated, false otherwise.
+  bool SetNodeDraining(const scheduling::NodeID &node_id,
+                       bool is_draining,
+                       int64_t draining_deadline_timestamp_ms);
+
+  /// @param max_num_nodes_to_include Max number of nodes to include in the debug string.
+  ///   If not specified, all nodes will be included.
+  std::string DebugString(
+      std::optional<size_t> max_num_nodes_to_include = std::nullopt) const;
+
+  /// Record metrics for the cluster resource manager.
+  void RecordMetrics() const;
 
   BundleLocationIndex &GetBundleLocationIndex();
 
   void SetNodeLabels(const scheduling::NodeID &node_id,
-                     const absl::flat_hash_map<std::string, std::string> &labels);
+                     absl::flat_hash_map<std::string, std::string> labels);
 
  private:
   friend class ClusterResourceScheduler;
@@ -172,11 +193,13 @@ class ClusterResourceManager {
   BundleLocationIndex bundle_location_index_;
 
   /// Timer to revert local changes to the resources periodically.
-  ray::PeriodicalRunner timer_;
+  std::shared_ptr<PeriodicalRunner> timer_;
+
+  mutable ray::stats::Gauge local_resource_view_node_count_gauge_;
 
   friend class ClusterResourceSchedulerTest;
   friend struct ClusterResourceManagerTest;
-  friend class raylet::ClusterTaskManagerTest;
+  friend class raylet::ClusterLeaseManagerTest;
   FRIEND_TEST(ClusterResourceSchedulerTest, SchedulingDeleteClusterNodeTest);
   FRIEND_TEST(ClusterResourceSchedulerTest, SchedulingModifyClusterNodeTest);
   FRIEND_TEST(ClusterResourceSchedulerTest, SchedulingUpdateAvailableResourcesTest);
@@ -195,10 +218,18 @@ class ClusterResourceManager {
   FRIEND_TEST(ClusterResourceSchedulerTest, AvailableResourceInstancesOpsTest);
   FRIEND_TEST(ClusterResourceSchedulerTest, DirtyLocalViewTest);
   FRIEND_TEST(ClusterResourceSchedulerTest, DynamicResourceTest);
-  FRIEND_TEST(ClusterTaskManagerTestWithGPUsAtHead, RleaseAndReturnWorkerCpuResources);
+  FRIEND_TEST(ClusterLeaseManagerTestWithGPUsAtHead, RleaseAndReturnWorkerCpuResources);
   FRIEND_TEST(ClusterResourceSchedulerTest, TestForceSpillback);
   FRIEND_TEST(ClusterResourceSchedulerTest, AffinityWithBundleScheduleTest);
-  FRIEND_TEST(GcsMonitorServerTest, TestGetSchedulingStatus);
+  FRIEND_TEST(ClusterResourceSchedulerTest, LabelSelectorIsSchedulableOnNodeTest);
+  FRIEND_TEST(ClusterResourceSchedulerTest, LabelSelectorHardNodeAffinityTest);
+  FRIEND_TEST(ClusterResourceSchedulerTest, ScheduleWithFallbackStrategyTest);
+  FRIEND_TEST(ClusterResourceSchedulerTest, FallbackStrategyWithUnavailableNodesTest);
+  FRIEND_TEST(ClusterResourceSchedulerTest,
+              FallbackSchedulesAvailableNodeOverUnavailablePrimary);
+  FRIEND_TEST(ClusterResourceSchedulerTest, FallbackWaitsOnUnavailableHighestPriority);
+  FRIEND_TEST(ClusterResourceSchedulerTest,
+              FallbackReturnsNilForGCSIfAllNodesUnavailable);
 
   friend class raylet::SchedulingPolicyTest;
   friend class raylet_scheduling_policy::HybridSchedulingPolicyTest;

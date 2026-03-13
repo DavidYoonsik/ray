@@ -1,30 +1,44 @@
-from dataclasses import dataclass
 import logging
 import os
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Optional
 
-import ray
-from ray.air.checkpoint import Checkpoint
-from ray.train.backend import BackendConfig, Backend, _warn_about_bad_checkpoint_type
-from ray.train.constants import DEFAULT_NCCL_SOCKET_IFNAME
-from ray.train._internal.worker_group import WorkerGroup
-from ray.train._internal.utils import get_address_and_port
-from ray.train.torch.torch_checkpoint import TorchCheckpoint
-from ray.util import PublicAPI
-
 import torch
 import torch.distributed as dist
+from packaging.version import Version
 
-try:
-    from torch.profiler import profile
-except ImportError:
-    profile = None
+import ray
+from ray._common.network_utils import build_address
+from ray._private import ray_constants
+from ray.air._internal.device_manager import register_custom_torch_dist_backend
+from ray.exceptions import GetTimeoutError
+from ray.train._internal.base_worker_group import BaseWorkerGroup
+from ray.train._internal.utils import get_address_and_port
+from ray.train.backend import Backend, BackendConfig
+from ray.train.constants import (
+    DEFAULT_TORCH_PROCESS_GROUP_SHUTDOWN_TIMEOUT_S,
+    TORCH_PROCESS_GROUP_SHUTDOWN_TIMEOUT_S,
+)
+from ray.util import PublicAPI
 
 logger = logging.getLogger(__name__)
 
 
-@PublicAPI(stability="beta")
+class TorchConfigContextManager:
+    def __enter__(self):
+        # Set default cuda device
+        if torch.cuda.is_available():
+            device = ray.train.torch.get_device()
+            if device.type == "cuda":
+                torch.cuda.set_device(device)
+
+    def __exit__(self, type, value, traceback):
+        # Propagate exceptions if any
+        return False
+
+
+@PublicAPI(stability="stable")
 @dataclass
 class TorchConfig(BackendConfig):
     """Configuration for torch process group setup.
@@ -51,19 +65,18 @@ class TorchConfig(BackendConfig):
     def backend_cls(self):
         return _TorchBackend
 
+    @property
+    def train_func_context(self):
+        return TorchConfigContextManager
 
-def _set_nccl_network_interface():
-    """Set the appropriate NCCL network interface to use."""
 
-    if "NCCL_SOCKET_IFNAME" not in os.environ:
-        logger.debug(
-            f"Setting NCCL_SOCKET_IFNAME to {DEFAULT_NCCL_SOCKET_IFNAME} "
-            f"to prioritize ethernet connection. To override this behavior, set the "
-            f"`NCCL_SOCKET_IFNAME` environment variable in your Ray runtime "
-            "environment: "
-            "`ray.init(runtime_env={{'env_vars': {'NCCL_SOCKET_IFNAME': 'ens5'}}}`"
-        )
-        os.environ["NCCL_SOCKET_IFNAME"] = DEFAULT_NCCL_SOCKET_IFNAME
+def _is_backend_nccl(backend: str) -> bool:
+    # Check containment because comma separated lists of backends like cpu:gloo,cuda:nccl are supported.
+    return backend == "nccl" or any(
+        item.split(":")[1] == "nccl"
+        for item in backend.split(",")
+        if item.startswith("cuda:")
+    )
 
 
 def _setup_torch_process_group(
@@ -94,21 +107,26 @@ def _setup_torch_process_group(
         )
     logger.debug(f"using {backend}")
 
-    # See the `timeout` arg in https://pytorch.org/docs/master/
-    # distributed.html#torch.distributed.init_process_group for description of
-    # NCCL_ASYNC_ERROR_HANDLING. We do not use NCCL_BLOCKING_WAIT due to performance
-    # overhead.
-    if (
-        backend == "nccl"
-        and "NCCL_ASYNC_ERROR_HANDLING" not in os.environ
-        and "NCCL_BLOCKING_WAIT" not in os.environ
-    ):
-        logger.debug(
-            "Setting NCCL_ASYNC_ERROR_HANDLING to fail if NCCL collective "
-            "communication operations are timing out. "
-            "To override this behavior, you can set NCCL_ASYNC_ERROR_HANDLING=0."
-        )
-        os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
+    if _is_backend_nccl(backend):
+        # See https://github.com/pytorch/pytorch/blob/c263bd43e8e8502d4726643bc6fd046f0130ac0e/torch/distributed/distributed_c10d.py#L803-L823 # noqa: E501
+        # We do not use TORCH_NCCL_BLOCKING_WAIT due to performance overhead.
+        if Version(torch.__version__) < Version("2.2.0"):
+            TORCH_NCCL_ASYNC_ERROR_HANDLING_ENV_VAR = "NCCL_ASYNC_ERROR_HANDLING"
+            TORCH_NCCL_BLOCKING_WAIT_ENV_VAR = "NCCL_BLOCKING_WAIT"
+        else:
+            TORCH_NCCL_ASYNC_ERROR_HANDLING_ENV_VAR = "TORCH_NCCL_ASYNC_ERROR_HANDLING"
+            TORCH_NCCL_BLOCKING_WAIT_ENV_VAR = "TORCH_NCCL_BLOCKING_WAIT"
+        if (
+            TORCH_NCCL_ASYNC_ERROR_HANDLING_ENV_VAR not in os.environ
+            and TORCH_NCCL_BLOCKING_WAIT_ENV_VAR not in os.environ
+        ):
+            logger.debug(
+                f"Setting {TORCH_NCCL_ASYNC_ERROR_HANDLING_ENV_VAR}=1 to fail if NCCL collective communication operations are timing out. "  # noqa: E501
+                f"To override this behavior, you can set {TORCH_NCCL_ASYNC_ERROR_HANDLING_ENV_VAR}=0."  # noqa: E501
+            )
+            os.environ[TORCH_NCCL_ASYNC_ERROR_HANDLING_ENV_VAR] = "1"
+    elif backend == "hccl":
+        register_custom_torch_dist_backend(backend)
 
     dist.init_process_group(
         backend=backend,
@@ -120,12 +138,10 @@ def _setup_torch_process_group(
 
 
 def _shutdown_torch(destroy_process_group=False):
-    from ray.train.torch.train_loop_utils import get_device
+    from ray.air._internal.torch_utils import get_devices
 
-    devices = get_device()
-    if not isinstance(devices, list):
-        devices = [devices]
-    if destroy_process_group:
+    devices = get_devices()
+    if destroy_process_group and dist.is_initialized():
         dist.destroy_process_group()
     if torch.cuda.is_available():
         for device in devices:
@@ -136,38 +152,36 @@ def _shutdown_torch(destroy_process_group=False):
 def _set_torch_distributed_env_vars():
     # Same env vars as in
     # https://pytorch.org/docs/stable/elastic/run.html#environment-variables
-    from ray.train._internal import session
-    from ray.train.torch.train_loop_utils import get_device
+    from ray.train.torch import get_device
 
-    os.environ["LOCAL_RANK"] = str(session.get_local_rank())
-    os.environ["RANK"] = str(session.get_world_rank())
-    os.environ["LOCAL_WORLD_SIZE"] = str(session.get_local_world_size())
-    os.environ["WORLD_SIZE"] = str(session.get_world_size())
-    os.environ["NODE_RANK"] = str(session.get_node_rank())
+    context = ray.train.get_context()
+    os.environ["LOCAL_RANK"] = str(context.get_local_rank())
+    os.environ["LOCAL_WORLD_SIZE"] = str(context.get_local_world_size())
+    os.environ["NODE_RANK"] = str(context.get_node_rank())
+    os.environ["RANK"] = str(context.get_world_rank())
+    os.environ["WORLD_SIZE"] = str(context.get_world_size())
 
     # Makes sure Hugging Face Accelerate uses the correct device
     device = get_device()
-    if isinstance(device, list):
-        device = device[0]
     os.environ["ACCELERATE_TORCH_DEVICE"] = str(device)
 
 
 class _TorchBackend(Backend):
     share_cuda_visible_devices: bool = True
 
-    def on_start(self, worker_group: WorkerGroup, backend_config: TorchConfig):
+    def on_start(self, worker_group: BaseWorkerGroup, backend_config: TorchConfig):
         if dist.is_available():
             # Set the appropriate training backend.
             if backend_config.backend is None:
-                if worker_group.num_gpus_per_worker > 0:
+                resources = worker_group.get_resources_per_worker()
+                num_gpus_per_worker = resources.get("GPU", 0)
+
+                if num_gpus_per_worker > 0:
                     backend = "nccl"
                 else:
                     backend = "gloo"
             else:
                 backend = backend_config.backend
-
-            if backend == "nccl":
-                worker_group.execute(_set_nccl_network_interface)
 
             master_addr, master_port = worker_group.execute_single(
                 0, get_address_and_port
@@ -181,7 +195,7 @@ class _TorchBackend(Backend):
                 worker_group.execute(set_env_vars, addr=master_addr, port=master_port)
                 url = "env://"
             elif backend_config.init_method == "tcp":
-                url = f"tcp://{master_addr}:{master_port}"
+                url = f"tcp://{build_address(master_addr, master_port)}"
             else:
                 raise ValueError(
                     f"The provided init_method ("
@@ -206,21 +220,23 @@ class _TorchBackend(Backend):
         else:
             raise RuntimeError("Distributed torch is not available.")
 
-    def on_shutdown(self, worker_group: WorkerGroup, backend_config: TorchConfig):
-        worker_group.execute(
+    def on_shutdown(self, worker_group: BaseWorkerGroup, backend_config):
+        futures = worker_group.execute_async(
             _shutdown_torch,
             destroy_process_group=len(worker_group) > 1,
         )
+        timeout_s = ray_constants.env_integer(
+            TORCH_PROCESS_GROUP_SHUTDOWN_TIMEOUT_S,
+            DEFAULT_TORCH_PROCESS_GROUP_SHUTDOWN_TIMEOUT_S,
+        )
+        try:
+            ray.get(futures, timeout=timeout_s)
+        except GetTimeoutError:
+            logger.warning(
+                f"Torch process group shutdown timed out after {timeout_s} seconds"
+            )
 
     def on_training_start(
-        self, worker_group: WorkerGroup, backend_config: BackendConfig
+        self, worker_group: BaseWorkerGroup, backend_config: BackendConfig
     ):
         worker_group.execute(_set_torch_distributed_env_vars)
-
-    @classmethod
-    def _encode_data(cls, checkpoint: Checkpoint):
-        checkpoint = super()._encode_data(checkpoint)
-        if type(checkpoint) is Checkpoint:
-            _warn_about_bad_checkpoint_type(TorchCheckpoint)
-            checkpoint = TorchCheckpoint.from_checkpoint(checkpoint)
-        return checkpoint

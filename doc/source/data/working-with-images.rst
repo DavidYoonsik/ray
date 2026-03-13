@@ -20,13 +20,13 @@ Reading images
 Ray Data can read images from a variety of formats.
 
 To view the full list of supported file formats, see the
-:ref:`Input/Output reference <input-output>`.
+:ref:`Loading Data API <loading-data-api>`.
 
 .. tab-set::
 
     .. tab-item:: Raw images
 
-        To load raw images like JPEG files, call :func:`~ray.data.read_images`.
+        To load raw images like JPEG files, call :func:`~ray.data.read_images`.  In the schema, the column name defaults to "image".
 
         .. note::
 
@@ -47,7 +47,28 @@ To view the full list of supported file formats, see the
 
             Column  Type
             ------  ----
-            image   numpy.ndarray(shape=(32, 32, 3), dtype=uint8)
+            image   ArrowTensorTypeV2(shape=(32, 32, 3), dtype=uint8)
+
+    .. tab-item:: Images from Dataset of URIs
+
+        To load images from a dataset of URIs, use the :func:`~ray.data.Dataset.with_column` method together with the :func:`~ray.data.expressions.download` expression.
+
+        .. testcode::
+
+            import ray
+            from ray.data.expressions import download
+
+            ds = ray.data.read_parquet("s3://anonymous@ray-example-data/imagenet/metadata_file.parquet")
+            ds = ds.with_column("bytes", download("image_url"))
+
+            print(ds.schema())
+
+        .. testoutput::
+
+            Column     Type
+            ------     ----
+            image_url  string
+            bytes      null
 
     .. tab-item:: NumPy
 
@@ -65,7 +86,7 @@ To view the full list of supported file formats, see the
 
             Column  Type
             ------  ----
-            data    numpy.ndarray(shape=(32, 32, 3), dtype=uint8)
+            data    ArrowTensorTypeV2(shape=(32, 32, 3), dtype=uint8)
 
     .. tab-item:: TFRecords
 
@@ -106,7 +127,7 @@ To view the full list of supported file formats, see the
             def decode_bytes(row: Dict[str, Any]) -> Dict[str, Any]:
                 data = row["image"]
                 image = Image.open(io.BytesIO(data))
-                row["image"] = np.array(image)
+                row["image"] = np.asarray(image)
                 return row
 
             ds = (
@@ -128,7 +149,7 @@ To view the full list of supported file formats, see the
 
             Column  Type
             ------  ----
-            image   numpy.ndarray(shape=(32, 32, 3), dtype=uint8)
+            image   ArrowTensorTypeV2(shape=(32, 32, 3), dtype=uint8)
             label   int64
 
     .. tab-item:: Parquet
@@ -147,7 +168,7 @@ To view the full list of supported file formats, see the
 
             Column  Type
             ------  ----
-            image   numpy.ndarray(shape=(32, 32, 3), dtype=uint8)
+            img     struct<bytes: binary, path: string>
             label   int64
 
 
@@ -243,17 +264,28 @@ Finally, call :meth:`Dataset.map_batches() <ray.data.Dataset.map_batches>`.
 
 For more information on performing inference, see
 :ref:`End-to-end: Offline Batch Inference <batch_inference_home>`
-and :ref:`Transforming batches with actors <transforming_data_actors>`.
+and :ref:`Stateful Transforms <stateful_transforms>`.
 
 .. _saving_images:
 
 Saving images
 -------------
 
-Save images with formats like Parquet, NumPy, and JSON. To view all supported formats,
-see the :ref:`Input/Output reference <input-output>`.
+Save images with formats like PNG, Parquet, and NumPy. To view all supported formats,
+see the :ref:`Saving Data API <saving-data-api>`.
 
 .. tab-set::
+
+    .. tab-item:: Images
+
+        To save images as image files, call :meth:`~ray.data.Dataset.write_images`.
+
+        .. testcode::
+
+            import ray
+
+            ds = ray.data.read_images("s3://anonymous@ray-example-data/image-datasets/simple")
+            ds.write_images("/tmp/simple", column="image", file_format="png")
 
     .. tab-item:: Parquet
 
@@ -277,16 +309,5 @@ see the :ref:`Input/Output reference <input-output>`.
 
             ds = ray.data.read_images("s3://anonymous@ray-example-data/image-datasets/simple")
             ds.write_numpy("/tmp/simple", column="image")
-
-    .. tab-item:: JSON
-
-        To save images in a JSON file, call :meth:`~ray.data.Dataset.write_json`.
-
-        .. testcode::
-
-            import ray
-
-            ds = ray.data.read_images("s3://anonymous@ray-example-data/image-datasets/simple")
-            ds.write_json("/tmp/simple")
 
 For more information on saving data, see :ref:`Saving data <loading_data>`.

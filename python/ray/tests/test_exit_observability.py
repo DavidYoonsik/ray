@@ -4,12 +4,15 @@ import signal
 import sys
 
 import pytest
-from ray._private.state_api_test_utils import verify_failed_task
 
 import ray
-from ray._private.test_utils import run_string_as_driver, wait_for_condition
-from ray.util.state import list_workers, list_nodes
+from ray._common.test_utils import (
+    run_string_as_driver,
+    wait_for_condition,
+)
+from ray._private.state_api_test_utils import verify_failed_task
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from ray.util.state import list_nodes, list_tasks, list_workers
 
 
 def get_worker_by_pid(pid, detail=True):
@@ -156,9 +159,11 @@ ray.shutdown()
         type = worker["exit_type"]
         detail = worker["exit_detail"]
         assert type == "INTENDED_USER_EXIT" and "exit_actor" in detail
-        return verify_failed_task(
-            name="exit", error_type="ACTOR_DIED", error_message="INTENDED_USER_EXIT"
-        )
+
+        t = list_tasks(filters=[("name", "=", "exit")])[0]
+        # exit_actor should be shown as non-task failure.
+        assert t["state"] == "FINISHED"
+        return True
 
     wait_for_condition(verify_worker_exit_actor)
 
@@ -172,11 +177,10 @@ ray.shutdown()
         type = worker["exit_type"]
         detail = worker["exit_detail"]
         assert type == "INTENDED_USER_EXIT" and "exit code 0" in detail
-        return verify_failed_task(
-            name="exit_with_exit_code",
-            error_type="ACTOR_DIED",
-            error_message=["INTENDED_USER_EXIT", "exit code 0"],
-        )
+        t = list_tasks(filters=[("name", "=", "exit_with_exit_code")])[0]
+        # exit_actor should be shown as non-task failure.
+        assert t["state"] == "FINISHED"
+        return True
 
     wait_for_condition(verify_exit_code_0)
 
@@ -231,8 +235,7 @@ ray.shutdown()
         assert type == "INTENDED_USER_EXIT" and "ray.cancel" in detail
         return verify_failed_task(
             name="cancel-f",
-            error_type="WORKER_DIED",  # Since it's a force cancel through kill signal.
-            error_message="Socket closed",
+            error_type="TASK_CANCELLED",
         )
 
     wait_for_condition(verify_exit_by_ray_cancel)
@@ -372,7 +375,9 @@ def test_worker_start_end_time(shutdown_only):
     pid = ray.get(worker.ready.remote())
 
     def verify():
-        workers = list_workers(detail=True, filters=[("pid", "=", pid)])[0]
+        workers = list_workers(
+            detail=True, filters=[("pid", "=", pid)], raise_on_missing_output=False
+        )[0]
         print(workers)
         assert workers["start_time_ms"] > 0
         assert workers["end_time_ms"] == 0
@@ -383,7 +388,9 @@ def test_worker_start_end_time(shutdown_only):
     ray.kill(worker)
 
     def verify():
-        workers = list_workers(detail=True, filters=[("pid", "=", pid)])[0]
+        workers = list_workers(
+            detail=True, filters=[("pid", "=", pid)], raise_on_missing_output=False
+        )[0]
         assert workers["start_time_ms"] > 0
         assert workers["end_time_ms"] > 0
         return True
@@ -396,7 +403,9 @@ def test_worker_start_end_time(shutdown_only):
     os.kill(pid, signal.SIGKILL)
 
     def verify():
-        workers = list_workers(detail=True, filters=[("pid", "=", pid)])[0]
+        workers = list_workers(
+            detail=True, filters=[("pid", "=", pid)], raise_on_missing_output=False
+        )[0]
         assert workers["start_time_ms"] > 0
         assert workers["end_time_ms"] > 0
         return True
@@ -447,9 +456,4 @@ def test_node_start_end_time(ray_start_cluster):
 
 
 if __name__ == "__main__":
-    import pytest
-
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

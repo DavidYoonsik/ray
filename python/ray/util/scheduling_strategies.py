@@ -1,4 +1,6 @@
-from typing import Dict, Union, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, Optional, Union
+
+from ray._raylet import NodeID
 from ray.util.annotations import PublicAPI
 
 if TYPE_CHECKING:
@@ -11,7 +13,7 @@ if TYPE_CHECKING:
 # "SPREAD": Spread scheduling on a best effort basis.
 
 
-@PublicAPI(stability="beta")
+@PublicAPI
 class PlacementGroupSchedulingStrategy:
     """Placement group based scheduling strategy.
 
@@ -37,7 +39,7 @@ class PlacementGroupSchedulingStrategy:
         self.placement_group_capture_child_tasks = placement_group_capture_child_tasks
 
 
-@PublicAPI(stability="beta")
+@PublicAPI
 class NodeAffinitySchedulingStrategy:
     """Static scheduling strategy used to run a task or actor on a particular node.
 
@@ -70,6 +72,33 @@ class NodeAffinitySchedulingStrategy:
         self.soft = soft
         self._spill_on_unavailable = _spill_on_unavailable
         self._fail_on_unavailable = _fail_on_unavailable
+
+        self._validate_attributes()
+
+    def _validate_attributes(self):
+        invalid_node_id_error = ValueError(
+            f"Invalid node_id '{self.node_id}'. Node ID must be a valid "
+            "hex string. To get a list of all nodes and their IDs in your cluster, "
+            "use ray.nodes(). See https://docs.ray.io/en/latest/ray-core/miscellaneous.html#node-information for more details."
+        )
+        try:
+            node_id = NodeID.from_hex(self.node_id)
+        except Exception as e:
+            raise invalid_node_id_error from e
+
+        if node_id.is_nil():
+            raise invalid_node_id_error
+
+        if self._spill_on_unavailable and not self.soft:
+            raise ValueError(
+                "_spill_on_unavailable cannot be set when soft is "
+                "False. Please set soft to True to use _spill_on_unavailable."
+            )
+        if self._fail_on_unavailable and self.soft:
+            raise ValueError(
+                "_fail_on_unavailable cannot be set when soft is "
+                "True. Please set soft to False to use _fail_on_unavailable."
+            )
 
 
 def _validate_label_match_operator_values(values, operator):
@@ -133,11 +162,12 @@ LabelMatchExpressionsT = Dict[str, Union[In, NotIn, Exists, DoesNotExist]]
 
 @PublicAPI(stability="alpha")
 class NodeLabelSchedulingStrategy:
-    """Label based node affinity scheduling strategy
+    """
+    Label based node affinity scheduling strategy
 
     scheduling_strategy=NodeLabelSchedulingStrategy({
-          "region": In("us"),
-          "gpu_type": Exists()
+        "region": In("us"),
+        "gpu_type": Exists(),
     })
     """
 
@@ -146,6 +176,14 @@ class NodeLabelSchedulingStrategy:
     ):
         self.hard = _convert_map_to_expressions(hard, "hard")
         self.soft = _convert_map_to_expressions(soft, "soft")
+        self._check_usage()
+
+    def _check_usage(self):
+        if not (self.hard or self.soft):
+            raise ValueError(
+                "The `hard` and `soft` parameter "
+                "of NodeLabelSchedulingStrategy cannot both be empty."
+            )
 
 
 def _convert_map_to_expressions(map_expressions: LabelMatchExpressionsT, param: str):

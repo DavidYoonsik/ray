@@ -9,19 +9,20 @@ import time
 from unittest import mock
 
 import numpy as np
-import psutil
 import pytest
 
 import ray
 import ray._private.gcs_utils as gcs_utils
 import ray._private.ray_constants as ray_constants
-import ray._private.resource_spec as resource_spec
 import ray._private.utils
 import ray.cluster_utils
 import ray.util.accelerators
-from ray._private.test_utils import wait_for_condition
+from ray._common.test_utils import wait_for_condition
+from ray._common.utils import RESOURCE_CONSTRAINT_PREFIX
 from ray.dashboard import k8s_utils
 from ray.runtime_env import RuntimeEnv
+
+import psutil
 
 logger = logging.getLogger(__name__)
 
@@ -92,39 +93,6 @@ def test_invalid_unicode_in_worker_log(shutdown_only):
     assert ray._private.services.remaining_processes_alive()
 
 
-@pytest.mark.skip(reason="This test is too expensive to run.")
-def test_move_log_files_to_old(shutdown_only):
-    info = ray.init(num_cpus=1)
-
-    logs_dir = os.path.join(info["session_dir"], "logs")
-
-    @ray.remote
-    class Actor:
-        def f(self):
-            print("function f finished")
-
-    # First create a temporary actor.
-    actors = [Actor.remote() for i in range(ray_constants.LOG_MONITOR_MAX_OPEN_FILES)]
-    ray.get([a.f.remote() for a in actors])
-
-    # Make sure no log files are in the "old" directory before the actors
-    # are killed.
-    assert len(glob.glob(f"{logs_dir}/old/worker*.out")) == 0
-
-    # Now kill the actors so the files get moved to logs/old/.
-    [a.__ray_terminate__.remote() for a in actors]
-
-    while True:
-        log_file_paths = glob.glob(f"{logs_dir}/old/worker*.out")
-        if len(log_file_paths) > 0:
-            with open(log_file_paths[0], "r") as f:
-                assert "function f finished\n" in f.readlines()
-            break
-
-    # Make sure that nothing has died.
-    assert ray._private.services.remaining_processes_alive()
-
-
 @pytest.mark.parametrize(
     "ray_start_cluster",
     [
@@ -178,11 +146,11 @@ def test_ray_address_environment_variable(ray_start_cluster):
     ray.shutdown()
 
 
-def test_ray_resources_environment_variable(ray_start_cluster):
-    address = ray_start_cluster.address
-
-    os.environ["RAY_OVERRIDE_RESOURCES"] = '{"custom1":1, "custom2":2, "CPU":3}'
-    ray.init(address=address, resources={"custom1": 3, "custom3": 3})
+def test_ray_resources_environment_variable(shutdown_only):
+    os.environ[
+        ray_constants.RESOURCES_ENVIRONMENT_VARIABLE
+    ] = '{"custom1":1, "custom2":2, "CPU":3}'
+    ray.init(resources={"custom1": 3, "custom3": 3})
 
     cluster_resources = ray.cluster_resources()
     print(cluster_resources)
@@ -192,52 +160,29 @@ def test_ray_resources_environment_variable(ray_start_cluster):
     assert cluster_resources["CPU"] == 3
 
 
-def test_gpu_info_parsing():
-    info_string = """Model:           Tesla V100-SXM2-16GB
-IRQ:             107
-GPU UUID:        GPU-8eaaebb8-bb64-8489-fda2-62256e821983
-Video BIOS:      88.00.4f.00.09
-Bus Type:        PCIe
-DMA Size:        47 bits
-DMA Mask:        0x7fffffffffff
-Bus Location:    0000:00:1e.0
-Device Minor:    0
-Blacklisted:     No
-    """
-    constraints_dict = resource_spec._constraints_from_gpu_info(info_string)
-    expected_dict = {
-        f"{ray_constants.RESOURCE_CONSTRAINT_PREFIX}V100": 1,
-    }
-    assert constraints_dict == expected_dict
+def test_ray_labels_environment_variables(shutdown_only):
+    os.environ[
+        ray_constants.LABELS_ENVIRONMENT_VARIABLE
+    ] = '{"custom1":"1", "custom2":"2"}'
+    ray.init(labels={"custom1": "3", "custom3": "3"})
 
-    info_string = """Model:           Tesla T4
-IRQ:             10
-GPU UUID:        GPU-415fe7a8-f784-6e3d-a958-92ecffacafe2
-Video BIOS:      90.04.84.00.06
-Bus Type:        PCIe
-DMA Size:        47 bits
-DMA Mask:        0x7fffffffffff
-Bus Location:    0000:00:1b.0
-Device Minor:    0
-Blacklisted:     No
-    """
-    constraints_dict = resource_spec._constraints_from_gpu_info(info_string)
-    expected_dict = {
-        f"{ray_constants.RESOURCE_CONSTRAINT_PREFIX}T4": 1,
-    }
-    assert constraints_dict == expected_dict
-
-    assert resource_spec._constraints_from_gpu_info(None) == {}
+    node_info = ray.nodes()[0]
+    assert node_info["Labels"]["custom1"] == "1"
+    assert node_info["Labels"]["custom2"] == "2"
+    assert node_info["Labels"]["custom3"] == "3"
 
 
-def test_accelerator_type_api(shutdown_only):
-    v100 = ray.util.accelerators.NVIDIA_TESLA_V100
-    resource_name = f"{ray_constants.RESOURCE_CONSTRAINT_PREFIX}{v100}"
+@pytest.mark.parametrize(
+    "accelerator_type",
+    [ray.util.accelerators.NVIDIA_TESLA_V100, ray.util.accelerators.AWS_NEURON_CORE],
+)
+def test_accelerator_type_api(accelerator_type, shutdown_only):
+    resource_name = f"{RESOURCE_CONSTRAINT_PREFIX}{accelerator_type}"
     ray.init(num_cpus=4, resources={resource_name: 1})
 
     quantity = 1
 
-    @ray.remote(accelerator_type=v100)
+    @ray.remote(accelerator_type=accelerator_type)
     def decorated_func(quantity):
         wait_for_condition(lambda: ray.available_resources()[resource_name] < quantity)
         return True
@@ -249,10 +194,12 @@ def test_accelerator_type_api(shutdown_only):
         return True
 
     assert ray.get(
-        ray.remote(via_options_func).options(accelerator_type=v100).remote(quantity)
+        ray.remote(via_options_func)
+        .options(accelerator_type=accelerator_type)
+        .remote(quantity)
     )
 
-    @ray.remote(accelerator_type=v100)
+    @ray.remote(accelerator_type=accelerator_type)
     class DecoratedActor:
         def __init__(self):
             pass
@@ -274,7 +221,9 @@ def test_accelerator_type_api(shutdown_only):
     wait_for_condition(lambda: ray.available_resources()[resource_name] < quantity)
 
     quantity = ray.available_resources()[resource_name]
-    with_options = ray.remote(ActorWithOptions).options(accelerator_type=v100).remote()
+    with_options = (
+        ray.remote(ActorWithOptions).options(accelerator_type=accelerator_type).remote()
+    )
     ray.get(with_options.initialized.remote())
     wait_for_condition(lambda: ray.available_resources()[resource_name] < quantity)
 
@@ -286,7 +235,7 @@ def test_get_system_memory():
         memory_limit_file.write("100")
         memory_limit_file.flush()
         assert (
-            ray._private.utils.get_system_memory(
+            ray._common.utils.get_system_memory(
                 memory_limit_filename=memory_limit_file.name,
                 memory_limit_filename_v2="__does_not_exist__",
             )
@@ -299,7 +248,7 @@ def test_get_system_memory():
         memory_limit_file.flush()
         psutil_memory_in_bytes = psutil.virtual_memory().total
         assert (
-            ray._private.utils.get_system_memory(
+            ray._common.utils.get_system_memory(
                 memory_limit_filename=memory_limit_file.name,
                 memory_limit_filename_v2="__does_not_exist__",
             )
@@ -310,7 +259,7 @@ def test_get_system_memory():
         memory_max_file.write("100\n")
         memory_max_file.flush()
         assert (
-            ray._private.utils.get_system_memory(
+            ray._common.utils.get_system_memory(
                 memory_limit_filename="__does_not_exist__",
                 memory_limit_filename_v2=memory_max_file.name,
             )
@@ -323,7 +272,7 @@ def test_get_system_memory():
         memory_max_file.flush()
         psutil_memory_in_bytes = psutil.virtual_memory().total
         assert (
-            ray._private.utils.get_system_memory(
+            ray._common.utils.get_system_memory(
                 memory_limit_filename="__does_not_exist__",
                 memory_limit_filename_v2=memory_max_file.name,
             )
@@ -689,9 +638,4 @@ def test_duplicated_arg(ray_start_cluster):
 
 
 if __name__ == "__main__":
-    import pytest
-
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

@@ -119,7 +119,7 @@ There's no hard rule about which style you should use. Choose the style that bes
 illustrates your API.
 
 .. tip::
-    If you're not sure which style to use, use *code-block-style*.
+    If you're not sure which style to use, use *code-output-style*.
 
 When to use *doctest-style*
 ===========================
@@ -138,39 +138,50 @@ want to print intermediate objects, use *doctest-style*. ::
         >>> ds.take(5)
         [{'id': 0}, {'id': 1}, {'id': 2}, {'id': 3}, {'id': 4}]
 
-When to use *code-block-style*
-==============================
+When to use *code-output-style*
+======================================
 
-If you're writing a longer example, or if object representations aren't relevant to your example, use *code-block-style*. ::
+If you're writing a longer example, or if object representations aren't relevant to your example, use *code-output-style*. ::
 
     .. testcode::
 
-        import pandas as pd
+        from typing import Dict
+        import numpy as np
         import ray
-        from ray.train.batch_predictor import BatchPredictor
 
-        def calculate_accuracy(df):
-            return pd.DataFrame({"correct": df["preds"] == df["label"]})
+        ds = ray.data.read_csv("s3://anonymous@air-example-data/iris.csv")
 
-        # Create a batch predictor that returns identity as the predictions.
-        batch_pred = BatchPredictor.from_pandas_udf(
-        lambda data: pd.DataFrame({"preds": data["feature_1"]}))
+        # Compute a "petal area" attribute.
+        def transform_batch(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+            vec_a = batch["petal length (cm)"]
+            vec_b = batch["petal width (cm)"]
+            batch["petal area (cm^2)"] = np.round(vec_a * vec_b, 2)
+            return batch
 
-        # Create a dummy dataset.
-        ds = ray.data.from_pandas(pd.DataFrame({
-        "feature_1": [1, 2, 3], "label": [1, 2, 3]}))
-
-        # Execute batch prediction using this predictor.
-        predictions = batch_pred.predict(ds,
-        feature_columns=["feature_1"], keep_columns=["label"])
-
-        # Calculate final accuracy
-        correct = predictions.map_batches(calculate_accuracy)
-        print(f"Final accuracy: {correct.sum(on='correct') / correct.count()}")
+        transformed_ds = ds.map_batches(transform_batch)
+        print(transformed_ds.materialize())
 
     .. testoutput::
 
-        Final accuracy: 1.0
+        shape: (150, 6)
+        ╭───────────────────┬──────────────────┬───────────────────┬──────────────────┬────────┬───────────────────╮
+        │ sepal length (cm) ┆ sepal width (cm) ┆ petal length (cm) ┆ petal width (cm) ┆ target ┆ petal area (cm^2) │
+        │ ---               ┆ ---              ┆ ---               ┆ ---              ┆ ---    ┆ ---               │
+        │ double            ┆ double           ┆ double            ┆ double           ┆ int64  ┆ double            │
+        ╞═══════════════════╪══════════════════╪═══════════════════╪══════════════════╪════════╪═══════════════════╡
+        │ 5.1               ┆ 3.5              ┆ 1.4               ┆ 0.2              ┆ 0      ┆ 0.28              │
+        │ 4.9               ┆ 3.0              ┆ 1.4               ┆ 0.2              ┆ 0      ┆ 0.28              │
+        │ 4.7               ┆ 3.2              ┆ 1.3               ┆ 0.2              ┆ 0      ┆ 0.26              │
+        │ 4.6               ┆ 3.1              ┆ 1.5               ┆ 0.2              ┆ 0      ┆ 0.3               │
+        │ 5.0               ┆ 3.6              ┆ 1.4               ┆ 0.2              ┆ 0      ┆ 0.28              │
+        │ …                 ┆ …                ┆ …                 ┆ …                ┆ …      ┆ …                 │
+        │ 6.7               ┆ 3.0              ┆ 5.2               ┆ 2.3              ┆ 2      ┆ 11.96             │
+        │ 6.3               ┆ 2.5              ┆ 5.0               ┆ 1.9              ┆ 2      ┆ 9.5               │
+        │ 6.5               ┆ 3.0              ┆ 5.2               ┆ 2.0              ┆ 2      ┆ 10.4              │
+        │ 6.2               ┆ 3.4              ┆ 5.4               ┆ 2.3              ┆ 2      ┆ 12.42             │
+        │ 5.9               ┆ 3.0              ┆ 5.1               ┆ 1.8              ┆ 2      ┆ 9.18              │
+        ╰───────────────────┴──────────────────┴───────────────────┴──────────────────┴────────┴───────────────────╯
+        (Showing 10 of 150 rows)
 
 When to use *literalinclude*
 ============================
@@ -196,10 +207,10 @@ To skip a *doctest-style* example, append `# doctest: +SKIP` to your Python code
         >>> import ray
         >>> ray.data.read_images("s3://private-bucket")  # doctest: +SKIP
 
-Skipping *code-block-style* examples
-====================================
+Skipping *code-output-style* examples
+==========================================
 
-To skip a *code-block-style* example, add `:skipif: True` to the `testoutput` block. ::
+To skip a *code-output-style* example, add `:skipif: True` to the `testcode` block. ::
 
     .. testcode::
         :skipif: True
@@ -224,16 +235,12 @@ To ignore parts of a *doctest-style* output, replace problematic sections with e
 
     >>> import ray
     >>> ray.data.read_images("s3://anonymous@ray-example-data/image-datasets/simple")
-    Dataset(
-       num_blocks=...,
-       num_rows=...,
-       schema={image: numpy.ndarray(shape=(32, 32, 3), dtype=uint8)}
-    )
+    Dataset(num_rows=..., schema=...)
 
-To ignore an output altogether, write a *code-block-style* snippet. Don't use `# doctest: +SKIP`.
+To ignore an output altogether, write a *code-output-style* snippet. Don't use `# doctest: +SKIP`.
 
-Ignoring *code-block-style* outputs
-===================================
+Ignoring *code-output-style* outputs
+========================================
 
 If parts of your output are long or non-deterministic, replace problematic sections
 with ellipses. ::
@@ -246,11 +253,7 @@ with ellipses. ::
 
     .. testoutput::
 
-        Dataset(
-           num_blocks=...,
-           num_rows=...,
-           schema={image: numpy.ndarray(shape=(32, 32, 3), dtype=uint8)}
-        )
+        Dataset(num_rows=..., schema=...)
 
 If your output is nondeterministic and you want to display a sample output, add
 `:options: +MOCK`. ::
@@ -265,17 +268,13 @@ If your output is nondeterministic and you want to display a sample output, add
 
         0.969461416250246
 
-If your output is hard to test and you don't want to display a sample output, use
-ellipses and `:hide:`. ::
+If your output is hard to test and you don't want to display a sample output, exclude
+the ``testoutput``. ::
 
     .. testcode::
 
         print("This output is hidden and untested")
 
-    .. testoutput::
-        :hide:
-
-        ...
 
 ------------------------------
 How to test examples with GPUs

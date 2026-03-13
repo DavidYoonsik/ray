@@ -1,18 +1,26 @@
 import importlib
 import logging
 import os
+import sys
+
+import httpx
 import pytest
-import requests
 import starlette
 from starlette.middleware import Middleware
-import sys
-import time
-
 
 import ray
-from ray.exceptions import RayActorError
 from ray import serve
+from ray._common.test_utils import wait_for_condition
+from ray.exceptions import RayActorError
+from ray.serve._private.test_utils import get_application_url
 from ray.serve._private.utils import call_function_from_import_path
+from ray.serve.config import HTTPOptions, gRPCOptions
+from ray.serve.context import _get_global_client
+from ray.serve.schema import (
+    LoggingConfig,
+    ProxyStatus,
+    ServeInstanceDetails,
+)
 
 
 # ==== Callbacks used in this test ====
@@ -76,8 +84,8 @@ def ray_instance(request):
 
     os.environ.update(requested_env_vars)
     importlib.reload(ray.serve._private.constants)
-    importlib.reload(ray.serve.controller)
-    importlib.reload(ray.serve._private.http_proxy)
+    importlib.reload(ray.serve._private.controller)
+    importlib.reload(ray.serve._private.proxy)
 
     yield ray.init()
 
@@ -121,6 +129,12 @@ def test_call_function_from_import_path():
 )
 def test_callback(ray_instance, capsys):
     """Test callback function works in http proxy and controller"""
+    serve.start(
+        http_options=HTTPOptions(
+            host="0.0.0.0",
+            request_timeout_s=500,
+        ),
+    )
 
     @serve.deployment
     class Model:
@@ -132,9 +146,10 @@ def test_callback(ray_instance, capsys):
             return "Not found custom headers"
 
     serve.run(Model.bind())
-    resp = requests.get("http://localhost:8000/")
-    assert resp.text == "custom_header_value"
+    url = get_application_url()
+    resp = httpx.get(url)
 
+    assert resp.text == "custom_header_value"
     captured = capsys.readouterr()
     assert "MyCustom message: hello" in captured.err
 
@@ -155,22 +170,24 @@ def test_callback_fail(ray_instance):
     Actor will fail to be started and further call will raise RayActorError.
     """
 
-    actor_def = ray.serve._private.http_proxy.HTTPProxyActor
+    actor_def = ray.serve._private.proxy.ProxyActor
     handle = actor_def.remote(
-        host="http_proxy",
-        port=123,
-        root_path="/",
-        controller_name="controller",
+        http_options=HTTPOptions(host="http_proxy", root_path="/", port=123),
+        grpc_options=gRPCOptions(),
         node_ip_address="127.0.0.1",
         node_id="123",
+        logging_config=LoggingConfig(),
+        long_poll_client="fake_client",
     )
     with pytest.raises(RayActorError, match="this is from raise_error_callback"):
         ray.get(handle.ready.remote())
 
-    actor_def = ray.serve.controller.ServeController
+    serve_controller = ray.serve._private.controller.ServeController
+    actor_def = ray.actor._make_actor(serve_controller, {})
     handle = actor_def.remote(
-        "controller",
-        http_config={},
+        http_options=HTTPOptions(),
+        grpc_options=gRPCOptions(),
+        global_logging_config=LoggingConfig(),
     )
     with pytest.raises(RayActorError, match="cannot be imported"):
         ray.get(handle.check_alive.remote())
@@ -188,14 +205,14 @@ def test_callback_fail(ray_instance):
 def test_http_proxy_return_aribitary_objects(ray_instance):
     """Test invalid callback path in http proxy"""
 
-    actor_def = ray.serve._private.http_proxy.HTTPProxyActor
+    actor_def = ray.serve._private.proxy.ProxyActor
     handle = actor_def.remote(
-        host="http_proxy",
-        port=123,
-        root_path="/",
-        controller_name="controller",
+        http_options=HTTPOptions(host="http_proxy", root_path="/", port=123),
+        grpc_options=gRPCOptions(),
         node_ip_address="127.0.0.1",
         node_id="123",
+        logging_config=LoggingConfig(),
+        long_poll_client="fake_client",
     )
     with pytest.raises(
         RayActorError, match="must return a list of Starlette middlewares"
@@ -212,8 +229,8 @@ def test_http_proxy_return_aribitary_objects(ray_instance):
     ],
     indirect=True,
 )
-def test_http_proxy_calllback_failures(ray_instance, capsys):
-    """Test http proxy into unhealthy state when callback function fails"""
+def test_http_proxy_callback_failures(ray_instance, capsys):
+    """Test http proxy keeps restarting when callback function fails"""
 
     try:
         serve.start()
@@ -223,17 +240,23 @@ def test_http_proxy_calllback_failures(ray_instance, capsys):
         # RayActorError.
         pass
 
-    # 1s sleep to be long enough for proxy unhealthy message logged.
-    time.sleep(1)
+    client = _get_global_client()
 
-    captured = capsys.readouterr()
-    assert "this is from raise_error_callback" in captured.err
-    # Error message printed when http proxy in STARTING state and not
-    # able to be started.
-    assert (
-        "Unexpected error occurred when checking readiness of HTTP Proxy"
-        in captured.err
-    )
+    def check_http_proxy_keep_restarting():
+        # The proxy will be under "STARTING" status and keep restarting.
+        prev_actor_id = None
+        while True:
+            serve_details = ServeInstanceDetails(**client.get_serve_details())
+            for _, proxy_info in serve_details.proxies.items():
+                if proxy_info.status != ProxyStatus.STARTING:
+                    return False
+                if prev_actor_id is None:
+                    prev_actor_id = proxy_info.actor_id
+                    break
+                elif prev_actor_id != proxy_info.actor_id:
+                    return True
+
+    wait_for_condition(check_http_proxy_keep_restarting)
 
 
 if __name__ == "__main__":

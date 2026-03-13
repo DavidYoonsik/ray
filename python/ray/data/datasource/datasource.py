@@ -1,123 +1,288 @@
-import builtins
-from copy import copy
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+import copy
+from typing import TYPE_CHECKING, Callable, Dict, Generator, Iterable, List, Optional
 
 import numpy as np
+import pyarrow as pa
 
-import ray
-from ray.data._internal.delegating_block_builder import DelegatingBlockBuilder
-from ray.data._internal.execution.interfaces import TaskContext
 from ray.data._internal.util import _check_pyarrow_version
-from ray.data.block import Block, BlockAccessor, BlockMetadata
-from ray.data.context import DataContext
-from ray.types import ObjectRef
+from ray.data.block import Block, BlockMetadata, Schema
+from ray.data.datasource.util import _iter_sliced_blocks
+from ray.data.expressions import Expr
 from ray.util.annotations import Deprecated, DeveloperAPI, PublicAPI
 
-WriteResult = Any
+if TYPE_CHECKING:
+    from ray.data.context import DataContext
+
+
+class _DatasourceProjectionPushdownMixin:
+    """Mixin for reading operators supporting projection pushdown"""
+
+    def supports_projection_pushdown(self) -> bool:
+        """Returns ``True`` in case ``Datasource`` supports projection operation
+        being pushed down into the reading layer"""
+        return False
+
+    def get_projection_map(self) -> Optional[Dict[str, str]]:
+        """Return the projection map (original column names -> final column names).
+
+        Returns:
+            Dict mapping original column names (in storage) to final column names
+            (after optional renames). Keys indicate which columns are selected.
+            None means all columns are selected with no renames.
+            Empty dict {} means no columns are selected.
+        """
+        return self._projection_map
+
+    def get_column_renames(self) -> Optional[Dict[str, str]]:
+        """Return the column renames from the projection map.
+
+        This is used by predicate pushdown to rewrite filter expressions
+        from renamed column names back to original column names.
+
+        Returns:
+            Dict mapping original column names to renamed names,
+            or None if no renaming has been applied.
+        """
+        if self._projection_map is None:
+            return None
+        # Only include actual renames (where key != value)
+        renames = {k: v for k, v in self._projection_map.items() if k != v}
+        return renames if renames else None
+
+    def _get_data_columns(self) -> Optional[List[str]]:
+        """Extract data columns from projection map.
+
+        Helper method for datasources that need to pass columns to legacy
+        read functions expecting separate columns and rename_map parameters.
+
+        Returns:
+            List of column names, or None if all columns should be read.
+            Empty list [] means no columns.
+        """
+        return (
+            list(self._projection_map.keys())
+            if self._projection_map is not None
+            else None
+        )
+
+    @staticmethod
+    def _combine_projection_map(
+        prev_projection_map: Optional[Dict[str, str]],
+        new_projection_map: Optional[Dict[str, str]],
+    ) -> Optional[Dict[str, str]]:
+        """Combine two projection maps via transitive composition.
+
+        Args:
+            prev_projection_map: Previous projection (original -> intermediate names)
+            new_projection_map: New projection to apply (intermediate -> final names)
+
+        Returns:
+            Combined projection map (original -> final names)
+
+        Examples:
+            >>> # Select columns a, b with no renames
+            >>> prev = {"a": "a", "b": "b"}
+            >>> # Select only 'a', rename to 'x'
+            >>> new = {"a": "x"}
+            >>> _DatasourceProjectionPushdownMixin._combine_projection_map(prev, new)
+            {'a': 'x'}
+
+            >>> # First rename a->temp
+            >>> prev = {"a": "temp"}
+            >>> # Then rename temp->final
+            >>> new = {"temp": "final"}
+            >>> _DatasourceProjectionPushdownMixin._combine_projection_map(prev, new)
+            {'a': 'final'}
+        """
+        # Handle None cases (None means "all columns, no renames")
+        if prev_projection_map is None:
+            return new_projection_map
+        elif new_projection_map is None:
+            return prev_projection_map
+
+        # Compose projections: for each original->intermediate mapping in prev,
+        # check if intermediate is selected by new projection
+        composed = {}
+        for orig_col, intermediate_name in prev_projection_map.items():
+            # If intermediate name is in new projection, follow the chain
+            if intermediate_name in new_projection_map:
+                final_name = new_projection_map[intermediate_name]
+                composed[orig_col] = final_name
+
+        # The composition already handles transitive chains correctly:
+        # prev {a: temp}, new {temp: final} -> composed {a: final}
+        # No need for collapse_transitive_map which would incorrectly remove
+        # identity mappings like {b: b}
+        return composed
+
+    def apply_projection(
+        self,
+        projection_map: Optional[Dict[str, str]],
+    ) -> "Datasource":
+        """Apply a projection to this datasource.
+
+        Args:
+            projection_map: Dict mapping original column names (in storage)
+                to final column names (after optional renames). Keys indicate
+                which columns to select. None means select all columns with no renames.
+
+        Returns:
+            A new datasource instance with the projection applied.
+        """
+        clone = copy.copy(self)
+
+        # Combine projections via transitive map composition
+        clone._projection_map = self._combine_projection_map(
+            self._projection_map, projection_map
+        )
+
+        return clone
+
+    @staticmethod
+    def _apply_rename(
+        table: "pa.Table",
+        column_rename_map: Optional[Dict[str, str]],
+    ) -> "pa.Table":
+        """Apply column renaming to a PyArrow table.
+
+        Args:
+            table: PyArrow table to rename
+            column_rename_map: Mapping from old column names to new names
+
+        Returns:
+            Table with renamed columns
+        """
+        if not column_rename_map:
+            return table
+
+        new_names = [column_rename_map.get(col, col) for col in table.schema.names]
+        return table.rename_columns(new_names)
+
+    @staticmethod
+    def _apply_rename_to_tables(
+        tables: Iterable["pa.Table"],
+        column_rename_map: Optional[Dict[str, str]],
+    ) -> Generator["pa.Table", None, None]:
+        """Wrap a table generator to apply column renaming to each table.
+
+        This helper eliminates duplication across datasources that need to apply
+        column renames to tables yielded from generators.
+
+        Args:
+            tables: Iterator/generator yielding PyArrow tables
+            column_rename_map: Mapping from old column names to new names
+
+        Yields:
+            pa.Table: Tables with renamed columns
+        """
+        for table in tables:
+            yield _DatasourceProjectionPushdownMixin._apply_rename(
+                table, column_rename_map
+            )
+
+
+class _DatasourcePredicatePushdownMixin:
+    """Mixin for reading operators supporting predicate pushdown"""
+
+    def __init__(self):
+        self._predicate_expr: Optional[Expr] = None
+
+    def supports_predicate_pushdown(self) -> bool:
+        return False
+
+    def get_current_predicate(self) -> Optional[Expr]:
+        return self._predicate_expr
+
+    def apply_predicate(
+        self,
+        predicate_expr: Expr,
+    ) -> "Datasource":
+        """Apply a predicate to this datasource.
+
+        Default implementation that combines predicates using AND.
+        Subclasses that support predicate pushdown should have a _predicate_expr
+        attribute to store the predicate.
+
+        Note: Column rebinding is handled by the PredicatePushdown rule
+        before this method is called, so the predicate_expr should already
+        reference the correct column names.
+        """
+        import copy
+
+        clone = copy.copy(self)
+
+        # Combine with existing predicate using AND
+        clone._predicate_expr = (
+            predicate_expr
+            if clone._predicate_expr is None
+            else clone._predicate_expr & predicate_expr
+        )
+
+        return clone
 
 
 @PublicAPI
-class Datasource:
+class Datasource(_DatasourceProjectionPushdownMixin, _DatasourcePredicatePushdownMixin):
     """Interface for defining a custom :class:`~ray.data.Dataset` datasource.
 
+    User may subclass this class to implement a custom datasource. The subclass should
+    implement :meth:`.get_read_tasks` and
+    :meth:`.estimate_inmemory_data_size` to read the data and estimate the in-memory data size, respectively.
+
     To read a datasource into a dataset, use :meth:`~ray.data.read_datasource`.
-    To write to a writable datasource, use :meth:`~ray.data.Dataset.write_datasource`.
 
-    See ``RangeDatasource`` and ``DummyOutputDatasource`` for examples
-    of how to implement readable and writable datasources.
-
-    For an example of subclassing :class:`~ray.data.Datasource`, read
-    :ref:`Implementing a Custom Datasource <custom_datasources>`.
-
-    .. note::
-        Datasource instances must be serializable, since
-        :meth:`~ray.data.Datasource.create_reader` and
-        :meth:`~ray.data.Datasource.write` are called in remote tasks.
-
+    Example:
+        >>> from ray.data.context import DataContext
+        >>> class MyDatasource(Datasource):
+        ...     def __init__(self, num_rows: int = 100):
+        ...         super().__init__()
+        ...         self.num_rows = num_rows
+        ...     def get_read_tasks(
+        ...         self,
+        ...         parallelism: int,
+        ...         per_task_row_limit: int | None = None,
+        ...         data_context: DataContext | None = None,
+        ...     ) -> List["ReadTask"]:
+        ...         # Split num_rows across parallelism tasks
+        ...         rows_per_task = self.num_rows // parallelism
+        ...         return [
+        ...             ReadTask(
+        ...                 lambda: [pa.Table.from_pydict({"data": range(rows_per_task)})],
+        ...                 BlockMetadata(rows_per_task, rows_per_task * 8, None, None),
+        ...             ) for _ in range(parallelism)
+        ...         ]
+        ...     def estimate_inmemory_data_size(self) -> Optional[int]:
+        ...         # Return total size for all data (independent of parallelism)
+        ...         return self.num_rows * 8
+        >>> ds = MyDatasource(num_rows=100)
+        >>> tasks = ds.get_read_tasks(parallelism=5)
+        >>> len(tasks) == 5
+        True
+        >>> tasks[0].metadata.num_rows == 20
+        True
+        >>> ds.estimate_inmemory_data_size() == sum(t.metadata.size_bytes for t in tasks)
+        True
     """  # noqa: E501
 
+    def __init__(self):
+        """Initialize the datasource and its mixins."""
+        _DatasourcePredicatePushdownMixin.__init__(self)
+
+    @Deprecated
     def create_reader(self, **read_args) -> "Reader":
-        """Return a Reader for the given read arguments.
-
-        The reader object will be responsible for querying the read metadata, and
-        generating the actual read tasks to retrieve the data blocks upon request.
-
-        Args:
-            read_args: Additional kwargs to pass to the datasource impl.
+        """
+        Deprecated: Implement :meth:`~ray.data.Datasource.get_read_tasks` and
+        :meth:`~ray.data.Datasource.estimate_inmemory_data_size` instead.
         """
         return _LegacyDatasourceReader(self, **read_args)
 
     @Deprecated
     def prepare_read(self, parallelism: int, **read_args) -> List["ReadTask"]:
-        """Deprecated: Please implement create_reader() instead."""
-        raise NotImplementedError
-
-    def write(
-        self,
-        blocks: Iterable[Block],
-        **write_args,
-    ) -> WriteResult:
-        """Write blocks out to the datasource. This is used by a single write task.
-
-        Args:
-            blocks: List of data blocks.
-            write_args: Additional kwargs to pass to the datasource impl.
-
-        Returns:
-            The output of the write task.
+        """
+        Deprecated: Implement :meth:`~ray.data.Datasource.get_read_tasks` and
+        :meth:`~ray.data.Datasource.estimate_inmemory_data_size` instead.
         """
         raise NotImplementedError
-
-    @Deprecated(
-        message="do_write() is deprecated in Ray 2.4. Use write() instead", warning=True
-    )
-    def do_write(
-        self,
-        blocks: List[ObjectRef[Block]],
-        metadata: List[BlockMetadata],
-        ray_remote_args: Dict[str, Any],
-        **write_args,
-    ) -> List[ObjectRef[WriteResult]]:
-        """Launch Ray tasks for writing blocks out to the datasource.
-
-        Args:
-            blocks: List of data block references. It is recommended that one
-                write task be generated per block.
-            metadata: List of block metadata.
-            ray_remote_args: Kwargs passed to ray.remote in the write tasks.
-            write_args: Additional kwargs to pass to the datasource impl.
-
-        Returns:
-            A list of the output of the write tasks.
-        """
-        raise NotImplementedError
-
-    def on_write_complete(self, write_results: List[WriteResult], **kwargs) -> None:
-        """Callback for when a write job completes.
-
-        This can be used to "commit" a write output. This method must
-        succeed prior to ``write_datasource()`` returning to the user. If this
-        method fails, then ``on_write_failed()`` will be called.
-
-        Args:
-            write_results: The list of the write task results.
-            kwargs: Forward-compatibility placeholder.
-        """
-        pass
-
-    def on_write_failed(
-        self, write_results: List[ObjectRef[WriteResult]], error: Exception, **kwargs
-    ) -> None:
-        """Callback for when a write job fails.
-
-        This is called on a best-effort basis on write failures.
-
-        Args:
-            write_results: The list of the write task result futures.
-            error: The first error encountered.
-            kwargs: Forward-compatibility placeholder.
-        """
-        pass
 
     def get_name(self) -> str:
         """Return a human-readable name for this datasource.
@@ -129,8 +294,56 @@ class Datasource:
             name = name[: -len(datasource_suffix)]
         return name
 
+    def estimate_inmemory_data_size(self) -> Optional[int]:
+        """Return an estimate of the in-memory data size, or None if unknown.
 
-@PublicAPI
+        Note that the in-memory data size may be larger than the on-disk data size.
+        """
+        raise NotImplementedError
+
+    def get_read_tasks(
+        self,
+        parallelism: int,
+        per_task_row_limit: Optional[int] = None,
+        data_context: Optional["DataContext"] = None,
+    ) -> List["ReadTask"]:
+        """Execute the read and return read tasks.
+
+        Args:
+            parallelism: The requested read parallelism. The number of read
+                tasks should equal to this value if possible.
+            per_task_row_limit: The per-task row limit for the read tasks.
+            data_context: The data context to use to get read tasks.
+        Returns:
+            A list of read tasks that can be executed to read blocks from the
+            datasource in parallel.
+        """
+        raise NotImplementedError
+
+    @property
+    def should_create_reader(self) -> bool:
+        """Return True if the datasource should create a legacy reader"""
+
+        has_implemented_get_read_tasks = (
+            type(self).get_read_tasks is not Datasource.get_read_tasks
+        )
+        has_implemented_estimate_inmemory_data_size = (
+            type(self).estimate_inmemory_data_size
+            is not Datasource.estimate_inmemory_data_size
+        )
+        # False when both get_read_tasks and estimate_inmemory_data_size are implemented
+        return not (
+            has_implemented_get_read_tasks
+            and has_implemented_estimate_inmemory_data_size
+        )
+
+    @property
+    def supports_distributed_reads(self) -> bool:
+        """If ``False``, only launch read tasks on the driver's node."""
+        return True
+
+
+@Deprecated
 class Reader:
     """A bound read operation for a :class:`~ray.data.Datasource`.
 
@@ -152,7 +365,6 @@ class Reader:
         Args:
             parallelism: The requested read parallelism. The number of read
                 tasks should equal to this value if possible.
-            read_args: Additional kwargs to pass to the datasource impl.
 
         Returns:
             A list of read tasks that can be executed to read blocks from the
@@ -169,7 +381,25 @@ class _LegacyDatasourceReader(Reader):
     def estimate_inmemory_data_size(self) -> Optional[int]:
         return None
 
-    def get_read_tasks(self, parallelism: int) -> List["ReadTask"]:
+    def get_read_tasks(
+        self,
+        parallelism: int,
+        per_task_row_limit: Optional[int] = None,
+        data_context: Optional["DataContext"] = None,
+    ) -> List["ReadTask"]:
+        """Execute the read and return read tasks.
+
+        Args:
+            parallelism: The requested read parallelism. The number of read
+                tasks should equal to this value if possible.
+            per_task_row_limit: The per-task row limit for the read tasks.
+            data_context: The data context to use to get read tasks. Not used by this
+                legacy reader.
+
+        Returns:
+            A list of read tasks that can be executed to read blocks from the
+            datasource in parallel.
+        """
         return self._datasource.prepare_read(parallelism, **self._read_args)
 
 
@@ -177,9 +407,9 @@ class _LegacyDatasourceReader(Reader):
 class ReadTask(Callable[[], Iterable[Block]]):
     """A function used to read blocks from the :class:`~ray.data.Dataset`.
 
-    Read tasks are generated by :meth:`~ray.data.datasource.Reader.get_read_tasks`,
+    Read tasks are generated by :meth:`~ray.data.Datasource.get_read_tasks`,
     and return a list of ``ray.data.Block`` when called. Initial metadata about the read
-    operation can be retrieved via ``get_metadata()`` prior to executing the
+    operation can be retrieved via the ``metadata`` attribute prior to executing the
     read. Final metadata is returned after the read along with the blocks.
 
     Ray will execute read tasks in remote functions to parallelize execution.
@@ -195,16 +425,37 @@ class ReadTask(Callable[[], Iterable[Block]]):
     contents of the block itself.
     """
 
-    def __init__(self, read_fn: Callable[[], Iterable[Block]], metadata: BlockMetadata):
+    def __init__(
+        self,
+        read_fn: Callable[[], Iterable[Block]],
+        metadata: BlockMetadata,
+        schema: Optional["Schema"] = None,
+        per_task_row_limit: Optional[int] = None,
+    ):
         self._metadata = metadata
         self._read_fn = read_fn
-        self._additional_output_splits = 1
+        self._schema = schema
+        self._per_task_row_limit = per_task_row_limit
 
-    def get_metadata(self) -> BlockMetadata:
+    @property
+    def metadata(self) -> BlockMetadata:
         return self._metadata
 
+    # TODO(justin): We want to remove schema from `ReadTask` later on
+    @property
+    def schema(self) -> Optional["Schema"]:
+        return self._schema
+
+    @property
+    def read_fn(self) -> Callable[[], Iterable[Block]]:
+        return self._read_fn
+
+    @property
+    def per_task_row_limit(self) -> Optional[int]:
+        """Get the per-task row limit for this read task."""
+        return self._per_task_row_limit
+
     def __call__(self) -> Iterable[Block]:
-        context = DataContext.get_current()
         result = self._read_fn()
         if not hasattr(result, "__iter__"):
             DeprecationWarning(
@@ -212,206 +463,11 @@ class ReadTask(Callable[[], Iterable[Block]]):
                 "Probably you need to return `[block]` instead of "
                 "`block`.".format(result)
             )
+        if self._per_task_row_limit is None:
+            yield from result
+            return
 
-        if context.block_splitting_enabled:
-            for block in result:
-                yield from self._do_additional_splits(block)
-        else:
-            builder = DelegatingBlockBuilder()
-            for block in result:
-                builder.add_block(block)
-            yield builder.build()
-
-    def _set_additional_split_factor(self, k: int) -> None:
-        self._additional_output_splits = k
-
-    def _do_additional_splits(self, block: Block) -> Iterable[Block]:
-        if self._additional_output_splits > 1:
-            block = BlockAccessor.for_block(block)
-            offset = 0
-            split_sizes = _splitrange(block.num_rows(), self._additional_output_splits)
-            for size in split_sizes:
-                yield block.slice(offset, offset + size, copy=True)
-                offset += size
-        else:
-            yield block
-
-
-@PublicAPI
-class RangeDatasource(Datasource):
-    """An example datasource that generates ranges of numbers from [0..n).
-
-    Examples:
-        >>> import ray
-        >>> from ray.data.datasource import RangeDatasource
-        >>> source = RangeDatasource() # doctest: +SKIP
-        >>> ray.data.read_datasource(source, n=10).take() # doctest: +SKIP
-        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-    """
-
-    def create_reader(
-        self,
-        n: int,
-        block_format: str = "arrow",
-        tensor_shape: Tuple = (1,),
-        column_name: Optional[str] = None,
-    ) -> List[ReadTask]:
-        return _RangeDatasourceReader(n, block_format, tensor_shape, column_name)
-
-
-class _RangeDatasourceReader(Reader):
-    def __init__(
-        self,
-        n: int,
-        block_format: str = "list",
-        tensor_shape: Tuple = (1,),
-        column_name: Optional[str] = None,
-    ):
-        self._n = n
-        self._block_format = block_format
-        self._tensor_shape = tensor_shape
-        self._column_name = column_name
-
-    def estimate_inmemory_data_size(self) -> Optional[int]:
-        if self._block_format == "tensor":
-            element_size = np.product(self._tensor_shape)
-        else:
-            element_size = 1
-        return 8 * self._n * element_size
-
-    def get_read_tasks(
-        self,
-        parallelism: int,
-    ) -> List[ReadTask]:
-        read_tasks: List[ReadTask] = []
-        n = self._n
-        block_format = self._block_format
-        tensor_shape = self._tensor_shape
-        block_size = max(1, n // parallelism)
-
-        # Example of a read task. In a real datasource, this would pull data
-        # from an external system instead of generating dummy data.
-        def make_block(start: int, count: int) -> Block:
-            if block_format == "arrow":
-                import pyarrow as pa
-
-                return pa.Table.from_arrays(
-                    [np.arange(start, start + count)],
-                    names=[self._column_name or "value"],
-                )
-            elif block_format == "tensor":
-                import pyarrow as pa
-
-                tensor = np.ones(tensor_shape, dtype=np.int64) * np.expand_dims(
-                    np.arange(start, start + count),
-                    tuple(range(1, 1 + len(tensor_shape))),
-                )
-                return BlockAccessor.batch_to_block(
-                    {self._column_name: tensor} if self._column_name else tensor
-                )
-            else:
-                return list(builtins.range(start, start + count))
-
-        if block_format == "arrow":
-            _check_pyarrow_version()
-            import pyarrow as pa
-
-            schema = pa.Table.from_pydict({self._column_name or "value": [0]}).schema
-        elif block_format == "tensor":
-            _check_pyarrow_version()
-            import pyarrow as pa
-
-            tensor = np.ones(tensor_shape, dtype=np.int64) * np.expand_dims(
-                np.arange(0, 10), tuple(range(1, 1 + len(tensor_shape)))
-            )
-            schema = BlockAccessor.batch_to_block(
-                {self._column_name: tensor} if self._column_name else tensor
-            ).schema
-        elif block_format == "list":
-            schema = int
-        else:
-            raise ValueError("Unsupported block type", block_format)
-        if block_format == "tensor":
-            element_size = np.product(tensor_shape)
-        else:
-            element_size = 1
-
-        i = 0
-        while i < n:
-            count = min(block_size, n - i)
-            meta = BlockMetadata(
-                num_rows=count,
-                size_bytes=8 * count * element_size,
-                schema=copy(schema),
-                input_files=None,
-                exec_stats=None,
-            )
-            read_tasks.append(
-                ReadTask(lambda i=i, count=count: [make_block(i, count)], meta)
-            )
-            i += block_size
-
-        return read_tasks
-
-
-@DeveloperAPI
-class DummyOutputDatasource(Datasource):
-    """An example implementation of a writable datasource for testing.
-
-    Examples:
-        >>> import ray
-        >>> from ray.data.datasource import DummyOutputDatasource
-        >>> output = DummyOutputDatasource() # doctest: +SKIP
-        >>> ray.data.range(10).write_datasource(output) # doctest: +SKIP
-        >>> assert output.num_ok == 1 # doctest: +SKIP
-    """
-
-    def __init__(self):
-        ctx = DataContext.get_current()
-
-        # Setup a dummy actor to send the data. In a real datasource, write
-        # tasks would send data to an external system instead of a Ray actor.
-        @ray.remote(scheduling_strategy=ctx.scheduling_strategy)
-        class DataSink:
-            def __init__(self):
-                self.rows_written = 0
-                self.enabled = True
-
-            def write(self, block: Block) -> str:
-                block = BlockAccessor.for_block(block)
-                self.rows_written += block.num_rows()
-                return "ok"
-
-            def get_rows_written(self):
-                return self.rows_written
-
-        self.data_sink = DataSink.remote()
-        self.num_ok = 0
-        self.num_failed = 0
-        self.enabled = True
-
-    def write(
-        self,
-        blocks: Iterable[Block],
-        ctx: TaskContext,
-        **write_args,
-    ) -> WriteResult:
-        tasks = []
-        if not self.enabled:
-            raise ValueError("disabled")
-        for b in blocks:
-            tasks.append(self.data_sink.write.remote(b))
-        ray.get(tasks)
-        return "ok"
-
-    def on_write_complete(self, write_results: List[WriteResult]) -> None:
-        assert all(w == "ok" for w in write_results), write_results
-        self.num_ok += 1
-
-    def on_write_failed(
-        self, write_results: List[ObjectRef[WriteResult]], error: Exception
-    ) -> None:
-        self.num_failed += 1
+        yield from _iter_sliced_blocks(result, self._per_task_row_limit)
 
 
 @DeveloperAPI
@@ -428,23 +484,13 @@ class RandomIntRowDatasource(Datasource):
         {'c_0': 4983608804013926748, 'c_1': 1160140066899844087}
     """
 
-    def get_name(self) -> str:
-        """Return a human-readable name for this datasource.
-        This will be used as the names of the read tasks.
-        Note: overrides the base `Datasource` method.
-        """
-        return "RandomInt"
-
-    def create_reader(
-        self,
-        n: int,
-        num_columns: int,
-    ) -> List[ReadTask]:
-        return _RandomIntRowDatasourceReader(n, num_columns)
-
-
-class _RandomIntRowDatasourceReader(Reader):
     def __init__(self, n: int, num_columns: int):
+        """Initialize the datasource that generates random-integer rows.
+
+        Args:
+            n: The number of rows to generate.
+            num_columns: The number of columns to generate.
+        """
         self._n = n
         self._num_columns = num_columns
 
@@ -454,6 +500,8 @@ class _RandomIntRowDatasourceReader(Reader):
     def get_read_tasks(
         self,
         parallelism: int,
+        per_task_row_limit: Optional[int] = None,
+        data_context: Optional["DataContext"] = None,
     ) -> List[ReadTask]:
         _check_pyarrow_version()
         import pyarrow
@@ -481,7 +529,6 @@ class _RandomIntRowDatasourceReader(Reader):
             meta = BlockMetadata(
                 num_rows=count,
                 size_bytes=8 * count * num_columns,
-                schema=schema,
                 input_files=None,
                 exec_stats=None,
             )
@@ -491,26 +538,17 @@ class _RandomIntRowDatasourceReader(Reader):
                         make_block(count, num_columns)
                     ],
                     meta,
+                    schema=schema,
+                    per_task_row_limit=per_task_row_limit,
                 )
             )
             i += block_size
 
         return read_tasks
 
-
-def _splitrange(n, k):
-    """Calculates array lens of np.array_split().
-
-    This is the equivalent of
-    `[len(x) for x in np.array_split(range(n), k)]`.
-    """
-    base = n // k
-    output = [base] * k
-    rem = n - sum(output)
-    for i in range(len(output)):
-        if rem > 0:
-            output[i] += 1
-            rem -= 1
-    assert rem == 0, (rem, output, n, k)
-    assert sum(output) == n, (output, n, k)
-    return output
+    def get_name(self) -> str:
+        """Return a human-readable name for this datasource.
+        This will be used as the names of the read tasks.
+        Note: overrides the base `Datasource` method.
+        """
+        return "RandomInt"

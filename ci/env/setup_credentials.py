@@ -1,13 +1,15 @@
 """
-This script is used to set up credentials for some services in the
-CI environment. For instance, it can fetch WandB API tokens and write
-the WandB configuration file so test scripts can use the service.
+This script sets up credentials for some services in the
+CI environment.
+This generates a bash script in the following format, which will
+then be sourced to run bazel test with.
+
+export WANDB_API_KEY=abcd
+export COMET_API_KEY=efgh
 """
 import json
+import subprocess
 import sys
-from pathlib import Path
-
-import boto3
 
 AWS_AIR_SECRETS_ARN = (
     "arn:aws:secretsmanager:us-west-2:029272617770:secret:"
@@ -15,68 +17,44 @@ AWS_AIR_SECRETS_ARN = (
 )
 
 
-def get_ray_air_secrets(client):
-    raw_string = client.get_secret_value(SecretId=AWS_AIR_SECRETS_ARN)["SecretString"]
-    return json.loads(raw_string)
+def get_ray_air_secrets():
+    output = subprocess.check_output(
+        [
+            "aws",
+            "secretsmanager",
+            "get-secret-value",
+            "--region",
+            "us-west-2",
+            "--secret-id",
+            AWS_AIR_SECRETS_ARN,
+        ]
+    )
 
-
-def write_wandb_api_key(api_key: str):
-    with open(Path("~/.netrc").expanduser(), "w") as fp:
-        fp.write(f"machine api.wandb.ai\n" f"  login user\n" f"  password {api_key}\n")
-
-
-def write_comet_ml_api_key(api_key: str):
-    with open(Path("~/.comet.config").expanduser(), "w") as fp:
-        fp.write(f"[comet]\napi_key={api_key}\n")
-
-
-def write_sigopt_api_key(api_key: str):
-    sigopt_config_file = Path("~/.sigopt/client/config.json").expanduser()
-    sigopt_config_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(sigopt_config_file, "wt") as f:
-        json.dump(
-            {
-                "api_token": api_key,
-                "code_tracking_enabled": False,
-                "log_collection_enabled": False,
-            },
-            f,
-        )
+    parsed_output = json.loads(output)
+    return json.loads(parsed_output["SecretString"])
 
 
 SERVICES = {
-    "wandb": ("wandb_key", write_wandb_api_key),
-    "comet_ml": ("comet_ml_token", write_comet_ml_api_key),
-    "sigopt": ("sigopt_key", write_sigopt_api_key),
+    "wandb_key": "WANDB_API_KEY",
+    "comet_ml_token": "COMET_API_KEY",
+    "snowflake_schema": "SNOWFLAKE_SCHEMA",
+    "snowflake_database": "SNOWFLAKE_DATABASE",
+    "snowflake_user": "SNOWFLAKE_USER",
+    "snowflake_account": "SNOWFLAKE_ACCOUNT",
+    "snowflake_warehouse": "SNOWFLAKE_WAREHOUSE",
+    "snowflake_private_key": "SNOWFLAKE_PRIVATE_KEY",
 }
 
 
 def main():
-    if len(sys.argv) < 2:
-        print(f"Usage: python {sys.argv[0]} <service1> [service2] ...")
-        sys.exit(0)
-
-    services = sys.argv[1:]
-
-    if any(service not in SERVICES for service in services):
-        raise RuntimeError(
-            f"All services must be included in {list(SERVICES.keys())}. "
-            f"Got: {services}"
-        )
-
     try:
-        client = boto3.client("secretsmanager", region_name="us-west-2")
-        ray_air_secrets = get_ray_air_secrets(client)
+        ray_air_secrets = get_ray_air_secrets()
     except Exception as e:
         print(f"Could not get Ray AIR secrets: {e}")
-        return
+        sys.exit(1)
 
-    for service in services:
-        try:
-            secret_key, setup_fn = SERVICES[service]
-            setup_fn(ray_air_secrets[secret_key])
-        except Exception as e:
-            print(f"Could not setup service credentials for {service}: {e}")
+    for key in SERVICES.keys():
+        print(f"export {SERVICES[key]}={ray_air_secrets[key]}")
 
 
 if __name__ == "__main__":

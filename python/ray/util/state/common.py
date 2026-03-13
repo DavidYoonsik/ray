@@ -2,16 +2,21 @@ import datetime
 import json
 import logging
 import sys
+import warnings
 from abc import ABC
 from dataclasses import asdict, field, fields
 from enum import Enum, unique
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import ray.dashboard.utils as dashboard_utils
-from ray._private.ray_constants import env_integer
-from ray.core.generated.common_pb2 import TaskStatus, TaskType
-from ray.core.generated.gcs_pb2 import TaskEvents
-from ray.util.state.custom_types import (
+
+# TODO(aguo): Instead of a version check, modify the below models
+# to use pydantic BaseModel instead of dataclass.
+# In pydantic 2, dataclass no longer needs the `init=True` kwarg to
+# generate an __init__ method. Additionally, it will raise an error if
+# it detects `init=True` to be set.
+from ray._common.pydantic_compat import IS_PYDANTIC_2
+from ray._private.custom_types import (
     TypeActorStatus,
     TypeNodeStatus,
     TypePlacementGroupStatus,
@@ -21,28 +26,20 @@ from ray.util.state.custom_types import (
     TypeWorkerExitType,
     TypeWorkerType,
 )
+from ray._private.ray_constants import env_integer
+from ray.core.generated.common_pb2 import TaskStatus, TaskType
+from ray.core.generated.gcs_pb2 import TaskEvents
+from ray.dashboard.modules.job.pydantic_models import JobDetails
 from ray.util.state.exception import RayStateApiException
 
 try:
-    import pydantic
     from pydantic.dataclasses import dataclass
 
-    from ray.dashboard.modules.job.pydantic_models import JobDetails
-
-    # TODO(aguo): Instead of a version check, modify these classes to use
-    # pydantic BaseModel instead of dataclass.
-    # In pydantic 2, dataclass no longer needs the `init=True` kwarg to
-    # generate an __init__ method. Additionally, it will raise an error if
-    # it detects `init=True` to be set.
-    is_pydantic_2 = pydantic.__version__.startswith("2")
 
 except ImportError:
     # pydantic is not available in the dashboard.
     # We will use the dataclass from the standard library.
     from dataclasses import dataclass
-
-    JobDetails = object
-    is_pydantic_2 = False
 
 
 logger = logging.getLogger(__name__)
@@ -50,6 +47,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_RPC_TIMEOUT = 30
 DEFAULT_LIMIT = 100
 DEFAULT_LOG_LIMIT = 1000
+DEFAULT_DOWNLOAD_FILENAME = "file.txt"
 
 # Max number of entries from API server to the client
 RAY_MAX_LIMIT_FROM_API_SERVER = env_integer(
@@ -94,7 +92,7 @@ class Humanify:
     convert units into a human readable string."""
 
     def timestamp(x: float):
-        """Converts miliseconds to a datetime object."""
+        """Converts milliseconds to a datetime object."""
         return str(datetime.datetime.fromtimestamp(x / 1000))
 
     def memory(x: int):
@@ -108,7 +106,7 @@ class Humanify:
         return str(format(x, ".3f")) + " B"
 
     def duration(x: int):
-        """Converts miliseconds to a human readable duration."""
+        """Converts milliseconds to a human readable duration."""
         return str(datetime.timedelta(milliseconds=x))
 
     def events(events: List[dict]):
@@ -126,7 +124,7 @@ class Humanify:
         return resources
 
 
-@dataclass(init=not is_pydantic_2)
+@dataclass(init=not IS_PYDANTIC_2)
 class ListApiOptions:
     # Maximum number of entries to return
     limit: int = DEFAULT_LIMIT
@@ -154,7 +152,7 @@ class ListApiOptions:
         # To return the data to users, when there's a partial failure
         # we need to have a timeout that's smaller than the users' timeout.
         # 80% is configured arbitrarily.
-        self.timeout = int(self.timeout * self.server_timeout_multiplier)
+        self.timeout = max(1, int(self.timeout * self.server_timeout_multiplier))
         assert self.timeout != 0, "0 second timeout is not supported."
         if self.filters is None:
             self.filters = []
@@ -167,14 +165,53 @@ class ListApiOptions:
                     "Available predicates: =, !=."
                 )
 
+    def has_conflicting_filters(self) -> bool:
+        # Check the filters in the ListApiOptions conflicts. Specifically for:
+        # - multiple '=' filters with the same key but different values.
+        # TODO(myan): More conflicts situation can be added for further optimization.
+        # For example, 2 filters with same key and same value but one with '=' predicate
+        # and ther other with '!=' predicate
+        equal_filters = {}
+        for filter in self.filters:
+            filter_key, filter_predicate, filter_value = filter
+            if filter_predicate == "=":
+                if (
+                    filter_key in equal_filters
+                    and equal_filters[filter_key] != filter_value
+                ):
+                    warnings.warn(
+                        "There are multiple '=' filters with the same "
+                        f"key '{filter_key}' but different values"
+                        f"'{equal_filters[filter_key]}' & '{filter_value}'. "
+                        "Empty result set will be returned",
+                        UserWarning,
+                    )
+                    return True
+                elif filter_key not in equal_filters:
+                    equal_filters[filter_key] = filter_value
 
-@dataclass(init=not is_pydantic_2)
+        return False
+
+
+@dataclass(init=not IS_PYDANTIC_2)
 class GetApiOptions:
     # Timeout for the HTTP request
     timeout: int = DEFAULT_RPC_TIMEOUT
+    # When the request is processed on the server side,
+    # we should apply multiplier so that server side can finish
+    # processing a request within timeout. Otherwise,
+    # timeout will always lead Http timeout.
+    server_timeout_multiplier: float = 0.8
+
+    def __post_init__(self):
+        # To return the data to users, when there's a partial failure
+        # we need to have a timeout that's smaller than the users' timeout.
+        # 80% is configured arbitrarily.
+        self.timeout = max(1, int(self.timeout * self.server_timeout_multiplier))
+        assert self.timeout != 0, "0 second timeout is not supported."
 
 
-@dataclass(init=not is_pydantic_2)
+@dataclass(init=not IS_PYDANTIC_2)
 class SummaryApiOptions:
     # Timeout for the HTTP request
     timeout: int = DEFAULT_RPC_TIMEOUT
@@ -286,7 +323,7 @@ class StateSchema(ABC):
     @classmethod
     def columns(cls) -> Set[str]:
         """Return a set of all columns."""
-        return set(cls.list_columns())
+        return set(cls.list_columns(detail=True))
 
     @classmethod
     def filterable_columns(cls) -> Set[str]:
@@ -345,7 +382,7 @@ def filter_fields(data: dict, state_dataclass: StateSchema, detail: bool) -> dic
     return filtered_data
 
 
-@dataclass(init=not is_pydantic_2)
+@dataclass(init=not IS_PYDANTIC_2)
 class GetLogOptions:
     timeout: int
     node_id: Optional[str] = None
@@ -353,8 +390,12 @@ class GetLogOptions:
     # One of {file, stream}. File means it will return the whole log.
     # stream means it will keep the connection and streaming the log.
     media_type: str = "file"
-    # The file name of the log.
+    # The filename to match when finding the log to download from the Ray log directory.
+    # NOTE: This can be a nested path relative to the Ray log directory.
     filename: Optional[str] = None
+    # The filename to download the log as on the client side.
+    # If not provided, the filename will be "file.txt".
+    download_filename: str = DEFAULT_DOWNLOAD_FILENAME
     # The actor id of the log. It is used only for worker logs.
     actor_id: Optional[str] = None
     # The task id of the log.
@@ -416,7 +457,7 @@ class GetLogOptions:
 
 # See the ActorTableData message in gcs.proto for all potential options that
 # can be included in this class.
-@dataclass(init=not is_pydantic_2)
+@dataclass(init=not IS_PYDANTIC_2)
 class ActorState(StateSchema):
     """Actor State"""
 
@@ -465,9 +506,25 @@ class ActorState(StateSchema):
     placement_group_id: Optional[str] = state_column(detail=True, filterable=True)
     #: Actor's repr name if a customized __repr__ method exists, else empty string.
     repr_name: Optional[str] = state_column(detail=True, filterable=True)
+    #: Number of restarts that has been tried on this actor.
+    num_restarts: int = state_column(filterable=False, detail=True)
+    #: Number of times this actor is restarted due to lineage reconstructions.
+    num_restarts_due_to_lineage_reconstruction: int = state_column(
+        filterable=False, detail=True
+    )
+    #: Number of times this actor is restarted due to node preemption.
+    num_restarts_due_to_node_preemption: int = state_column(
+        filterable=False, detail=True
+    )
+    #: The call site of the actor creation.
+    call_site: Optional[str] = state_column(detail=True, filterable=False)
+    #: The label selector for the actor.
+    label_selector: Optional[dict] = state_column(detail=True, filterable=False)
+    #: The fallback options for the label selector.
+    fallback_strategy: Optional[dict] = state_column(detail=True, filterable=False)
 
 
-@dataclass(init=not is_pydantic_2)
+@dataclass(init=not IS_PYDANTIC_2)
 class PlacementGroupState(StateSchema):
     """PlacementGroup State"""
 
@@ -496,7 +553,7 @@ class PlacementGroupState(StateSchema):
     stats: Optional[dict] = state_column(filterable=False, detail=True)
 
 
-@dataclass(init=not is_pydantic_2)
+@dataclass(init=not IS_PYDANTIC_2)
 class NodeState(StateSchema):
     """Node State"""
 
@@ -511,6 +568,9 @@ class NodeState(StateSchema):
     #: ALIVE: The node is alive.
     #: DEAD: The node is dead.
     state: TypeNodeStatus = state_column(filterable=True)
+    #: The state message of the node.
+    #: This provides more detailed information about the node's state.
+    state_message: Optional[str] = state_column(filterable=False)
     #: The name of the node if it is given by the name argument.
     node_name: str = state_column(filterable=True)
     #: The total resources of the node.
@@ -531,9 +591,10 @@ class NodeState(StateSchema):
     )
 
 
-# NOTE:
-# Declaring this as dataclass would make __init__ not being called properly.
-class JobState(StateSchema, JobDetails):
+# NOTE: Declaring this as dataclass would make __init__ not being called properly.
+# NOTE: `JobDetails` will be `None` in the minimal install because Pydantic is not
+#       installed. Inheriting from `None` raises an exception.
+class JobState(StateSchema, JobDetails if JobDetails is not None else object):
     """The state of the job that's submitted by Ray's Job APIs or driver jobs"""
 
     def __init__(self, **kwargs):
@@ -550,7 +611,7 @@ class JobState(StateSchema, JobDetails):
         return state
 
     @classmethod
-    def list_columns(cls, detail: bool = False) -> List[str]:
+    def list_columns(cls, detail: bool = True) -> List[str]:
         if not detail:
             return [
                 "job_id",
@@ -562,7 +623,7 @@ class JobState(StateSchema, JobDetails):
                 "error_type",
                 "driver_info",
             ]
-        if isinstance(JobDetails, object):
+        if JobDetails is None:
             # We don't have pydantic in the dashboard. This is because
             # we call this method at module import time, so we need to
             # check if the class is a pydantic model.
@@ -571,9 +632,9 @@ class JobState(StateSchema, JobDetails):
         # TODO(aguo): Once we only support pydantic 2, we can remove this if check.
         # In pydantic 2.0, `__fields__` has been renamed to `model_fields`.
         return (
-            JobDetails.model_fields
+            list(JobDetails.model_fields.keys())
             if hasattr(JobDetails, "model_fields")
-            else JobDetails.__fields__
+            else list(JobDetails.__fields__.keys())
         )
 
     def asdict(self):
@@ -588,7 +649,7 @@ class JobState(StateSchema, JobDetails):
         }
 
 
-@dataclass(init=not is_pydantic_2)
+@dataclass(init=not IS_PYDANTIC_2)
 class WorkerState(StateSchema):
     """Worker State"""
 
@@ -630,12 +691,16 @@ class WorkerState(StateSchema):
     #: -> start_time_ms (worker is ready to be used).
     #: -> end_time_ms (worker is destroyed).
     worker_launch_time_ms: Optional[int] = state_column(
-        filterable=False, detail=True, format_fn=Humanify.timestamp
+        filterable=False,
+        detail=True,
+        format_fn=lambda x: "" if x == -1 else Humanify.timestamp(x),
     )
-    #: The time worker is succesfully launched
+    #: The time worker is successfully launched
     #: -1 if the value doesn't exist.
     worker_launched_time_ms: Optional[int] = state_column(
-        filterable=False, detail=True, format_fn=Humanify.timestamp
+        filterable=False,
+        detail=True,
+        format_fn=lambda x: "" if x == -1 else Humanify.timestamp(x),
     )
     #: The time when the worker is started and initialized.
     #: 0 if the value doesn't exist.
@@ -648,9 +713,13 @@ class WorkerState(StateSchema):
     end_time_ms: Optional[int] = state_column(
         filterable=False, detail=True, format_fn=Humanify.timestamp
     )
+    # the debugger port of the worker
+    debugger_port: Optional[int] = state_column(filterable=True, detail=True)
+    # the number of threads paused in this worker
+    num_paused_threads: Optional[int] = state_column(filterable=True, detail=True)
 
 
-@dataclass(init=not is_pydantic_2)
+@dataclass(init=not IS_PYDANTIC_2)
 class ClusterEventState(StateSchema):
     severity: str = state_column(filterable=True)
     time: str = state_column(filterable=False)
@@ -660,7 +729,7 @@ class ClusterEventState(StateSchema):
     custom_fields: Optional[dict] = state_column(filterable=False, detail=True)
 
 
-@dataclass(init=not is_pydantic_2)
+@dataclass(init=not IS_PYDANTIC_2)
 class TaskState(StateSchema):
     """Task State"""
 
@@ -744,9 +813,16 @@ class TaskState(StateSchema):
     task_log_info: Optional[dict] = state_column(detail=True, filterable=False)
     #: Task error detail info.
     error_message: Optional[str] = state_column(detail=True, filterable=False)
+    # Is task paused by the debugger
+    is_debugger_paused: Optional[bool] = state_column(detail=True, filterable=True)
+    #: The call site of the task.
+    call_site: Optional[str] = state_column(detail=True, filterable=False)
+    #: The label selector for the task.
+    label_selector: Optional[dict] = state_column(detail=True, filterable=False)
+    fallback_strategy: Optional[dict] = state_column(detail=True, filterable=False)
 
 
-@dataclass(init=not is_pydantic_2)
+@dataclass(init=not IS_PYDANTIC_2)
 class ObjectState(StateSchema):
     """Object State"""
 
@@ -771,6 +847,8 @@ class ObjectState(StateSchema):
     #:   to the remote worker + queueing time from the execution side.
     #: - RUNNING: The task that is running.
     task_status: TypeTaskStatus = state_column(filterable=True)
+    #: The number of times the task has been executed (including the current execution)
+    attempt_number: int = state_column(filterable=True)
     #: The reference type of the object.
     #: See :ref:`Debugging with Ray Memory <debug-with-ray-memory>` for more details.
     #:
@@ -802,7 +880,7 @@ class ObjectState(StateSchema):
     ip: str = state_column(filterable=True)
 
 
-@dataclass(init=not is_pydantic_2)
+@dataclass(init=not IS_PYDANTIC_2)
 class RuntimeEnvState(StateSchema):
     """Runtime Environment State"""
 
@@ -858,7 +936,7 @@ for state in AVAILABLE_STATES:
 """
 
 
-@dataclass(init=not is_pydantic_2)
+@dataclass(init=not IS_PYDANTIC_2)
 class ListApiResponse:
     # NOTE(rickyyx): We currently perform hard truncation when querying
     # resources which could have a large number (e.g. asking raylets for
@@ -874,7 +952,7 @@ class ListApiResponse:
     #      v
     # - num_filtered
     #      |  With limiting,
-    #      |  set by min(`RAY_MAX_LIMIT_FROM_API_SERER`, <user-supplied limit>)
+    #      |  set by min(`RAY_MAX_LIMIT_FROM_API_SERVER`, <user-supplied limit>)
     #      v
     # - len(result)
 
@@ -904,7 +982,7 @@ Summary API schema
 DRIVER_TASK_ID_PREFIX = "ffffffffffffffffffffffffffffffffffffffff"
 
 
-@dataclass(init=not is_pydantic_2)
+@dataclass(init=not IS_PYDANTIC_2)
 class TaskSummaryPerFuncOrClassName:
     #: The function or class name of this task.
     func_or_class_name: str
@@ -923,7 +1001,7 @@ class Link:
     id: str
 
 
-@dataclass(init=not is_pydantic_2)
+@dataclass(init=not IS_PYDANTIC_2)
 class NestedTaskSummary:
     #: The name of this task group
     name: str
@@ -1010,7 +1088,8 @@ class TaskSummaries:
         Step 2: Put the tasks in a tree structure based on ownership
         Step 3: Merge together siblings in the tree if there are more
         than one with the same name.
-        Step 4: Total the children
+        Step 4: Sort by running and then errored and then successful tasks
+        Step 5: Total the children
 
         This can probably be more efficient if we merge together some steps to
         reduce the amount of iterations but this algorithm produces very easy to
@@ -1237,11 +1316,32 @@ class TaskSummaries:
         # Step 3
         summary, _ = merge_sibings_for_task_group(summary)
 
+        def get_running_tasks_count(task_group: NestedTaskSummary) -> int:
+            return (
+                task_group.state_counts.get("RUNNING", 0)
+                + task_group.state_counts.get("RUNNING_IN_RAY_GET", 0)
+                + task_group.state_counts.get("RUNNING_IN_RAY_WAIT", 0)
+            )
+
+        def get_pending_tasks_count(task_group: NestedTaskSummary) -> int:
+            return (
+                task_group.state_counts.get("PENDING_ARGS_AVAIL", 0)
+                + task_group.state_counts.get("PENDING_NODE_ASSIGNMENT", 0)
+                + task_group.state_counts.get("PENDING_OBJ_STORE_MEM_AVAIL", 0)
+                + task_group.state_counts.get("PENDING_ARGS_FETCH", 0)
+            )
+
         def sort_task_groups(task_groups: List[NestedTaskSummary]) -> None:
-            # Sort by timestamp
+            # Sort by running tasks, pending tasks, failed tasks, timestamp,
+            # and actor_creation_task
             # Put actor creation tasks above other tasks with the same timestamp
             task_groups.sort(key=lambda x: 0 if x.type == "ACTOR_CREATION_TASK" else 1)
             task_groups.sort(key=lambda x: x.timestamp or sys.maxsize)
+            task_groups.sort(
+                key=lambda x: x.state_counts.get("FAILED", 0), reverse=True
+            )
+            task_groups.sort(key=get_pending_tasks_count, reverse=True)
+            task_groups.sort(key=get_running_tasks_count, reverse=True)
 
         def calc_total_for_task_group(
             task_group: NestedTaskSummary,
@@ -1278,7 +1378,7 @@ class TaskSummaries:
         )
 
 
-@dataclass(init=not is_pydantic_2)
+@dataclass(init=not IS_PYDANTIC_2)
 class ActorSummaryPerClass:
     #: The class name of the actor.
     class_name: str
@@ -1323,7 +1423,7 @@ class ActorSummaries:
         )
 
 
-@dataclass(init=not is_pydantic_2)
+@dataclass(init=not IS_PYDANTIC_2)
 class ObjectSummaryPerKey:
     #: Total number of objects of the type.
     total_objects: int
@@ -1336,6 +1436,9 @@ class ObjectSummaryPerKey:
     #: State name to the count dict. State name is equivalent to
     #: ObjectState.
     task_state_counts: Dict[TypeTaskStatus, int] = field(default_factory=dict)
+    #: Attempt number to the count dict. The attempt number include the current
+    #: execution
+    task_attempt_number_counts: Dict[str, int] = field(default_factory=dict)
     #: Ref count type to the count dict. State name is equivalent to
     #: ObjectState.
     ref_type_counts: Dict[TypeReferenceType, int] = field(default_factory=dict)
@@ -1385,6 +1488,11 @@ class ObjectSummaries:
                 object_summary.task_state_counts[task_state] = 0
             object_summary.task_state_counts[task_state] += 1
 
+            attempt_number = str(object["attempt_number"])
+            if attempt_number not in object_summary.task_attempt_number_counts:
+                object_summary.task_attempt_number_counts[attempt_number] = 0
+            object_summary.task_attempt_number_counts[attempt_number] += 1
+
             ref_type = object["reference_type"]
             if ref_type not in object_summary.ref_type_counts:
                 object_summary.ref_type_counts[ref_type] = 0
@@ -1416,7 +1524,7 @@ class ObjectSummaries:
         )
 
 
-@dataclass(init=not is_pydantic_2)
+@dataclass(init=not IS_PYDANTIC_2)
 class StateSummary:
     #: Node ID -> summary per node
     #: If the data is not required to be orgnized per node, it will contain
@@ -1424,7 +1532,7 @@ class StateSummary:
     node_id_to_summary: Dict[str, Union[TaskSummaries, ActorSummaries, ObjectSummaries]]
 
 
-@dataclass(init=not is_pydantic_2)
+@dataclass(init=not IS_PYDANTIC_2)
 class SummaryApiResponse:
     # Carried over from ListApiResponse
     # We currently use list API for listing the resources
@@ -1481,7 +1589,7 @@ def protobuf_message_to_dict(
     return dashboard_utils.message_to_dict(
         message,
         fields_to_decode,
-        including_default_value_fields=True,
+        always_print_fields_with_no_presence=True,
         preserving_proto_field_name=preserving_proto_field_name,
     )
 
@@ -1531,12 +1639,22 @@ def protobuf_to_task_state_dict(message: TaskEvents) -> dict:
                 "runtime_env_info",
                 "parent_task_id",
                 "placement_group_id",
+                "call_site",
+                "label_selector",
+                "fallback_strategy",
             ],
         ),
         (task_attempt, ["task_id", "attempt_number", "job_id"]),
         (
             state_updates,
-            ["node_id", "worker_id", "task_log_info", "actor_repr_name", "worker_pid"],
+            [
+                "node_id",
+                "worker_id",
+                "task_log_info",
+                "actor_repr_name",
+                "worker_pid",
+                "is_debugger_paused",
+            ],
         ),
     ]
     for src, keys in mappings:
@@ -1548,24 +1666,27 @@ def protobuf_to_task_state_dict(message: TaskEvents) -> dict:
     task_state["end_time_ms"] = None
     events = []
 
-    for state in TaskStatus.keys():
-        key = f"{state.lower()}_ts"
-        if key in state_updates:
-            # timestamp is recorded as nanosecond from the backend.
-            # We need to convert it to the second.
-            ts_ms = int(state_updates[key]) // 1e6
-            events.append(
-                {
-                    "state": state,
-                    "created_ms": ts_ms,
-                }
-            )
-            if state == "PENDING_ARGS_AVAIL":
-                task_state["creation_time_ms"] = ts_ms
-            if state == "RUNNING":
-                task_state["start_time_ms"] = ts_ms
-            if state == "FINISHED" or state == "FAILED":
-                task_state["end_time_ms"] = ts_ms
+    if "state_ts_ns" in state_updates:
+        state_ts_ns = state_updates["state_ts_ns"]
+        for state_name, state in TaskStatus.items():
+            # state_ts_ns is Map[str, str] after protobuf MessageToDict
+            key = str(state)
+            if key in state_ts_ns:
+                # timestamp is recorded as nanosecond from the backend.
+                # We need to convert it to the second.
+                ts_ms = int(state_ts_ns[key]) // 1e6
+                events.append(
+                    {
+                        "state": state_name,
+                        "created_ms": ts_ms,
+                    }
+                )
+                if state == TaskStatus.PENDING_ARGS_AVAIL:
+                    task_state["creation_time_ms"] = ts_ms
+                if state == TaskStatus.RUNNING:
+                    task_state["start_time_ms"] = ts_ms
+                if state == TaskStatus.FINISHED or state == TaskStatus.FAILED:
+                    task_state["end_time_ms"] = ts_ms
 
     task_state["events"] = events
     if len(events) > 0:
@@ -1609,17 +1730,18 @@ def remove_ansi_escape_codes(text: str) -> str:
     return re.sub(r"\x1b[^m]*m", "", text)
 
 
-def dict_to_state(d: Dict, state_schema: StateSchema) -> StateSchema:
+def dict_to_state(d: Dict, state_resource: StateResource) -> StateSchema:
     """Convert a dict to a state schema.
 
     Args:
         d: a dict to convert.
-        state_schema: a schema to convert to.
+        state_resource: the state resource to convert to.
 
     Returns:
         A state schema.
     """
     try:
-        return resource_to_schema(state_schema)(**d)
+        return resource_to_schema(state_resource)(**d)
+
     except Exception as e:
         raise RayStateApiException(f"Failed to convert {d} to StateSchema: {e}") from e

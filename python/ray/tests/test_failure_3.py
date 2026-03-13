@@ -1,22 +1,22 @@
-import os
-import sys
-import signal
-import threading
 import json
+import os
+import signal
+import sys
+import threading
+import time
 from pathlib import Path
 
-import ray
 import numpy as np
 import pytest
-import psutil
-import time
 
+import ray
+from ray._common.test_utils import SignalActor, wait_for_condition
 from ray._private.test_utils import (
-    SignalActor,
-    wait_for_pid_to_exit,
-    wait_for_condition,
     run_string_as_driver_nonblocking,
+    wait_for_pid_to_exit,
 )
+
+import psutil
 
 SIGKILL = signal.SIGKILL if sys.platform != "win32" else signal.SIGTERM
 
@@ -46,6 +46,39 @@ def test_worker_exit_after_parent_raylet_dies(ray_start_cluster):
     wait_for_pid_to_exit(raylet_pid)
     # Make sure the worker process exits as well.
     wait_for_pid_to_exit(worker_pid)
+
+
+def test_plasma_store_operation_after_raylet_dies(ray_start_cluster):
+    """
+    Test that the operation on the plasma store after the raylet dies will not fail the
+    task with an application level error (RayTaskError) but a system level error
+    (RayletDiedError).
+    """
+    cluster = ray_start_cluster
+    system_configs = {
+        "health_check_initial_delay_ms": 0,
+        "health_check_timeout_ms": 100,
+        "health_check_failure_threshold": 1,
+    }
+    cluster.add_node(
+        num_cpus=1,
+        _system_config=system_configs,
+    )
+    cluster.wait_for_nodes()
+
+    ray.init(address=cluster.address)
+
+    @ray.remote
+    def get_after_raylet_dies():
+        raylet_pid = int(os.environ["RAY_RAYLET_PID"])
+        os.kill(raylet_pid, SIGKILL)
+        wait_for_pid_to_exit(raylet_pid)
+        ray.put([0] * 100000)
+
+    try:
+        ray.get(get_after_raylet_dies.remote(), timeout=10)
+    except Exception as e:
+        assert isinstance(e, ray.exceptions.LocalRayletDiedError)
 
 
 @pytest.mark.parametrize(
@@ -451,10 +484,116 @@ while True:
     )
 
 
-if __name__ == "__main__":
-    import pytest
+@pytest.mark.skipif(sys.platform != "linux", reason="Only works on linux.")
+def test_worker_cleans_up_child_procs_on_raylet_death(ray_start_cluster, tmp_path):
+    """
+    CoreWorker kills its child processes if the raylet dies.
+    This test creates 20 leaked processes; 10 from a single actor task, and
+    10 from distinct non-actor tasks.
 
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    Once the raylet dies, the test verifies all leaked processes are cleaned up.
+    """
+
+    output_file_path = tmp_path / "leaked_pids.json"
+    ray_start_cluster.add_node()
+    driver_script = f"""
+import ray
+import json
+import multiprocessing
+import shutil
+import time
+import os
+
+def change_name_and_sleep(label: str, index: int) -> None:
+    proctitle = "child_proc_name_prefix_" + label + "_" + str(index)
+    ray._raylet.setproctitle(proctitle)
+    time.sleep(1000)
+
+def create_child_proc(label, index):
+    proc = multiprocessing.Process(
+        target=change_name_and_sleep,
+        args=(label, index,),
+        daemon=True,
+    )
+    proc.start()
+    return proc.pid
+
+@ray.remote
+class LeakerActor:
+    def create_leaked_child_process(self, num_to_leak):
+        print("creating leaked process", os.getpid())
+
+        pids = []
+        for index in range(num_to_leak):
+            pid = create_child_proc("actor", index)
+            pids.append(pid)
+
+        return pids
+
+@ray.remote
+def leaker_task(index):
+    print("Creating leaked process", os.getpid())
+    return create_child_proc("task", index)
+
+num_to_leak_per_type = 10
+print('starting actors')
+actor = LeakerActor.remote()
+actor_leaked_pids = ray.get(actor.create_leaked_child_process.remote(
+    num_to_leak=num_to_leak_per_type,
+))
+
+task_leaked_pids = ray.get([
+    leaker_task.remote(index) for index in range(num_to_leak_per_type)
+])
+leaked_pids = actor_leaked_pids + task_leaked_pids
+
+final_file = "{output_file_path}"
+tmp_file = final_file + ".tmp"
+with open(tmp_file, "w") as f:
+    json.dump(leaked_pids, f)
+shutil.move(tmp_file, final_file)
+
+while True:
+    print(os.getpid())
+    time.sleep(1)
+    """
+
+    print("Running string as driver")
+    driver_proc = run_string_as_driver_nonblocking(driver_script)
+
+    # Wait for the json file containing the child PIDS
+    # to be present.
+    print("Waiting for child pids json")
+    wait_for_condition(
+        condition_predictor=lambda: Path(output_file_path).exists(),
+        timeout=30,
+    )
+
+    # Load the PIDs of the child processes.
+    with open(output_file_path, "r") as f:
+        pids = json.load(f)
+
+    # Validate all children of the worker processes are in a sleeping state.
+    processes = [psutil.Process(pid) for pid in pids]
+    assert all([proc.status() == psutil.STATUS_SLEEPING for proc in processes])
+
+    # Obtain psutil handle for raylet process
+    raylet_proc = [p for p in psutil.process_iter() if p.name() == "raylet"]
+    assert len(raylet_proc) == 1
+    raylet_proc = raylet_proc[0]
+
+    # Kill the raylet process and reap the zombie
+    raylet_proc.kill()
+    raylet_proc.wait()
+
+    print("Waiting for child procs to die")
+    wait_for_condition(
+        condition_predictor=lambda: all([not proc.is_running() for proc in processes]),
+        timeout=30,
+    )
+
+    driver_proc.kill()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main(["-sv", __file__]))

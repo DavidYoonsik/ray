@@ -1,19 +1,18 @@
 import json
 import os
-
-import numpy as np
-import pandas as pd
-from pathlib import Path
-import pytest
-import time
 import shutil
 import signal
 import subprocess
 import sys
+import time
+from pathlib import Path
 
-from ray.tune.result_grid import ResultGrid
+import numpy as np
+import pandas as pd
+import pytest
+
 from ray.tune.analysis import ExperimentAnalysis
-
+from ray.tune.result_grid import ResultGrid
 
 _RUN_SCRIPT_FILENAME = "_test_experiment_restore_run.py"
 
@@ -51,26 +50,22 @@ def test_experiment_restore(tmp_path, runner_type):
         - Without any interrupts/restoration:
             - Minimum runtime: 4 rounds * 4 seconds / round = 16 seconds
         - The test will stop the script with a SIGINT at a random time between
-        4-8 iterations each restore.
+        6-10 iterations each restore.
 
     - For Trainer.restore:
         - 1 trial with 4 workers
         - Each iteration takes 0.5 seconds
         - Runs for 32 iterations --> Minimum runtime = 16 seconds
         - The test will stop the script with a SIGINT at a random time between
-        4-8 iterations after each restore.
+        6-10 iterations after each restore.
 
     Requirements:
-    - Req 1: Reasonable runtime
-        - The experiment should finish within 2 * 16 = 32 seconds.
-        - 2x is the passing threshold.
-        - 16 seconds is the minimum runtime.
-    - Req 2: Training progress persisted
+    - Req 1: Training progress persisted
         - The experiment should progress monotonically.
         (The training iteration shouldn't go backward at any point)
         - Trials shouldn't start from scratch.
-    - Req 3: Searcher state saved/restored correctly
-    - Req 4: Callback state saved/restored correctly
+    - Req 2: Searcher state saved/restored correctly
+    - Req 3: Callback state saved/restored correctly
     """
 
     np.random.seed(2023)
@@ -102,41 +97,33 @@ def test_experiment_restore(tmp_path, runner_type):
 
     total_iters = iters_per_trial * num_trials
 
-    env = {
-        "RUNNER_TYPE": runner_type,
-        "STORAGE_PATH": str(storage_path),
-        "EXP_NAME": exp_name,
-        "CALLBACK_DUMP_FILE": str(callback_dump_file),
-        "RUN_STARTED_MARKER": str(run_started_marker),
-        "TIME_PER_ITER_S": str(time_per_iter_s),
-        "ITERATIONS_PER_TRIAL": str(iters_per_trial),
-        "NUM_TRIALS": str(num_trials),
-        "MAX_CONCURRENT_TRIALS": str(max_concurrent),
-        "CSV_DATA_FILE": csv_file,
-        "TUNE_NEW_EXECUTION": os.environ.get("TUNE_NEW_EXECUTION", "1"),
-    }
-
-    # Pass criteria
-    no_interrupts_runtime = 16.0
-    # Todo(krfricke): See if we can improve the actor startup/shutdown time
-    # to reduce the passing factor again.
-    passing_factor = 2.5
-    passing_runtime = no_interrupts_runtime * passing_factor
-    _print_message(
-        "Experiment should finish with a total runtime of\n"
-        f"<= {passing_runtime} seconds."
+    env = os.environ.copy()
+    env.update(
+        {
+            "RUNNER_TYPE": runner_type,
+            "STORAGE_PATH": str(storage_path),
+            "EXP_NAME": exp_name,
+            "CALLBACK_DUMP_FILE": str(callback_dump_file),
+            "RUN_STARTED_MARKER": str(run_started_marker),
+            "TIME_PER_ITER_S": str(time_per_iter_s),
+            "ITERATIONS_PER_TRIAL": str(iters_per_trial),
+            "NUM_TRIALS": str(num_trials),
+            "MAX_CONCURRENT_TRIALS": str(max_concurrent),
+            "CSV_DATA_FILE": csv_file,
+        }
     )
 
     # Variables used in the loop
     return_code = None
     total_runtime = 0
     run_iter = 0
+    progress = 0
     progress_history = []
 
     poll_interval_s = 0.1
     test_start_time = time.monotonic()
 
-    while total_runtime < passing_runtime:
+    while True:
         run_started_marker.write_text("", encoding="utf-8")
 
         run = subprocess.Popen([sys.executable, script_path], env=env)
@@ -153,22 +140,17 @@ def test_experiment_restore(tmp_path, runner_type):
             return_code = run.poll()
             break
 
-        timeout_s = min(
-            np.random.uniform(4 * time_per_iter_s, 8 * time_per_iter_s),
-            passing_runtime - total_runtime,
-        )
+        timeout_s = np.random.uniform(6 * time_per_iter_s, 10 * time_per_iter_s)
 
         _print_message(
             "Training has started...\n"
             f"Interrupting after {timeout_s:.2f} seconds\n"
-            f"Currently at {total_runtime:.2f}/{passing_runtime} seconds"
+            f"Currently at {total_runtime:.2f} seconds"
         )
 
         # Sleep for a random amount of time, then stop the run.
         start_time = time.monotonic()
-        stopping_time = start_time + timeout_s
-        while time.monotonic() < stopping_time:
-            time.sleep(poll_interval_s)
+        time.sleep(timeout_s)
         total_runtime += time.monotonic() - start_time
 
         return_code = run.poll()
@@ -191,7 +173,7 @@ def test_experiment_restore(tmp_path, runner_type):
         _print_message(
             f"Number of trials = {len(results)}\n"
             f"% completion = {progress} ({sum(iters)} iters / {total_iters})\n"
-            f"Currently at {total_runtime:.2f}/{passing_runtime} seconds"
+            f"Currently at {total_runtime:.2f} seconds"
         )
 
     _print_message(
@@ -201,12 +183,7 @@ def test_experiment_restore(tmp_path, runner_type):
     )
     test_end_time = time.monotonic()
 
-    # Req 1: runtime
-    assert total_runtime <= passing_runtime, (
-        f"Expected runtime to be <= {passing_runtime}, but ran for: {total_runtime}. "
-        f"This means the experiment did not finish (iterations still running). Are "
-        f"there any performance regressions or expensive failure recoveries??"
-    )
+    assert progress == 1.0
 
     # The script shouldn't have errored. (It should have finished by this point.)
     assert return_code == 0, (
@@ -214,14 +191,14 @@ def test_experiment_restore(tmp_path, runner_type):
         f"Check the `{_RUN_SCRIPT_FILENAME}` script for any issues. "
     )
 
-    # Req 2: training progress persisted
+    # Req 1: training progress persisted
     # Check that progress increases monotonically (we never go backwards/start from 0)
     assert np.all(np.diff(progress_history) >= 0), (
         "Expected progress to increase monotonically. Instead, got:\n"
         "{progress_history}"
     )
 
-    # Req 3: searcher state
+    # Req 2: searcher state
     results = ResultGrid(ExperimentAnalysis(str(storage_path / exp_name)))
     # Check that all trials have unique ids assigned by the searcher (if applicable)
     ids = [result.config.get("id", -1) for result in results]
@@ -232,7 +209,7 @@ def test_experiment_restore(tmp_path, runner_type):
             f"{ids}"
         )
 
-    # Req 4: callback state
+    # Req 3: callback state
     with open(callback_dump_file, "r") as f:
         callback_state = json.load(f)
 

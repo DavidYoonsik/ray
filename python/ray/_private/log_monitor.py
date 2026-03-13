@@ -7,14 +7,16 @@ import os
 import platform
 import re
 import shutil
+import sys
 import time
 import traceback
-from typing import Callable, List, Set
+from typing import Callable, List, Optional, Set
 
 import ray._private.ray_constants as ray_constants
-import ray._private.services as services
 import ray._private.utils
+from ray._private import logging_utils
 from ray._private.ray_logging import setup_component_logger
+from ray._raylet import GcsClient
 
 # Logger for this module. It should be configured at the entry point
 # into the program using Ray. Ray provides a default configuration at
@@ -22,9 +24,9 @@ from ray._private.ray_logging import setup_component_logger
 logger = logging.getLogger(__name__)
 
 # The groups are job id, and pid.
-WORKER_LOG_PATTERN = re.compile(".*worker.*-([0-9a-f]+)-(\d+)")
+WORKER_LOG_PATTERN = re.compile(r".*worker.*-([0-9a-f]+)-(\d+)")
 # The groups are job id.
-RUNTIME_ENV_SETUP_PATTERN = re.compile(".*runtime_env_setup-(\d+).log")
+RUNTIME_ENV_SETUP_PATTERN = re.compile(r".*runtime_env_setup-(\d+).log")
 # Log name update interval under pressure.
 # We need it because log name update is CPU intensive and uses 100%
 # of cpu when there are many log files.
@@ -67,19 +69,31 @@ class LogFileInfo:
 
     def reopen_if_necessary(self):
         """Check if the file's inode has changed and reopen it if necessary.
+
         There are a variety of reasons what we would logically consider a file
         would have different inodes, such as log rotation or file syncing
         semantics.
+
+        If the file is smaller than our recorded file position, we assume it has been
+        rotated and start reading it from the beginning.
         """
         try:
             open_inode = None
             if self.file_handle and not self.file_handle.closed:
                 open_inode = os.fstat(self.file_handle.fileno()).st_ino
 
-            new_inode = os.stat(self.filename).st_ino
-            if open_inode != new_inode:
+            new_statinfo = os.stat(self.filename)
+            if new_statinfo.st_ino != open_inode:
                 self.file_handle = open(self.filename, "rb")
+
+                # If the new file is smaller than the last read position, assume that
+                # the file has been rotated and read from the beginning. Else, continue
+                # from the existing file position.
+                if new_statinfo.st_size < self.file_position:
+                    self.file_position = 0
+
                 self.file_handle.seek(self.file_position)
+                self.size_when_last_opened = new_statinfo.st_size
         except Exception:
             logger.debug(f"file no longer exists, skip re-opening of {self.filename}")
 
@@ -132,21 +146,40 @@ class LogMonitor:
 
     def __init__(
         self,
-        logs_dir,
-        gcs_publisher,
+        node_ip_address: str,
+        logs_dir: str,
+        gcs_client: GcsClient,
         is_proc_alive_fn: Callable[[int], bool],
         max_files_open: int = ray_constants.LOG_MONITOR_MAX_OPEN_FILES,
+        gcs_address: Optional[str] = None,
     ):
         """Initialize the log monitor object."""
-        self.ip: str = services.get_node_ip_address()
+        self.ip: str = node_ip_address
         self.logs_dir: str = logs_dir
-        self.publisher = gcs_publisher
+        self.gcs_client = gcs_client
         self.log_filenames: Set[str] = set()
         self.open_file_infos: List[LogFileInfo] = []
         self.closed_file_infos: List[LogFileInfo] = []
         self.can_open_more_files: bool = True
         self.max_files_open: int = max_files_open
         self.is_proc_alive_fn: Callable[[int], bool] = is_proc_alive_fn
+        self.is_autoscaler_v2: bool = self.get_is_autoscaler_v2(gcs_address)
+
+        logger.info(
+            f"Starting log monitor with [max open files={max_files_open}],"
+            f" [is_autoscaler_v2={self.is_autoscaler_v2}]"
+        )
+
+    def get_is_autoscaler_v2(self, gcs_address: Optional[str]) -> bool:
+        """Check if autoscaler v2 is enabled."""
+        if gcs_address is None:
+            return False
+
+        if not ray.experimental.internal_kv._internal_kv_initialized():
+            ray.experimental.internal_kv._initialize_internal_kv(self.gcs_client)
+        from ray.autoscaler.v2.utils import is_autoscaler_v2
+
+        return is_autoscaler_v2()
 
     def _close_all_files(self):
         """Close all open files (so that we can open more)."""
@@ -194,27 +227,36 @@ class LogMonitor:
 
     def update_log_filenames(self):
         """Update the list of log files to monitor."""
+        monitor_log_paths = []
         # output of user code is written here
-        log_file_paths = glob.glob(f"{self.logs_dir}/worker*[.out|.err]") + glob.glob(
-            f"{self.logs_dir}/java-worker*.log"
-        )
+        monitor_log_paths += glob.glob(
+            f"{self.logs_dir}/worker*[.out|.err]"
+        ) + glob.glob(f"{self.logs_dir}/java-worker*.log")
         # segfaults and other serious errors are logged here
-        raylet_err_paths = glob.glob(f"{self.logs_dir}/raylet*.err")
+        monitor_log_paths += glob.glob(f"{self.logs_dir}/raylet*.err")
         # monitor logs are needed to report autoscaler events
-        monitor_log_paths = glob.glob(f"{self.logs_dir}/monitor.log")
+        # TODO(rickyx): remove this after migration.
+        if not self.is_autoscaler_v2:
+            # We publish monitor logs in autoscaler v1
+            monitor_log_paths += glob.glob(f"{self.logs_dir}/monitor.log")
+        else:
+            # We publish autoscaler events directly in autoscaler v2
+            monitor_log_paths += glob.glob(
+                f"{self.logs_dir}/events/event_AUTOSCALER.log"
+            )
+
         # If gcs server restarts, there can be multiple log files.
-        gcs_err_path = glob.glob(f"{self.logs_dir}/gcs_server*.err")
+        monitor_log_paths += glob.glob(f"{self.logs_dir}/gcs_server*.err")
+
+        # Add libtpu logs if they exist in the Ray container.
+        tpu_log_dir = f"{self.logs_dir}/tpu_logs"
+        if os.path.isdir(tpu_log_dir):
+            monitor_log_paths += glob.glob(f"{self.logs_dir}/tpu_logs/**")
+
         # runtime_env setup process is logged here
-        runtime_env_setup_paths = []
         if RAY_RUNTIME_ENV_LOG_TO_DRIVER_ENABLED:
-            runtime_env_setup_paths = glob.glob(f"{self.logs_dir}/runtime_env*.log")
-        for file_path in (
-            log_file_paths
-            + raylet_err_paths
-            + gcs_err_path
-            + monitor_log_paths
-            + runtime_env_setup_paths
-        ):
+            monitor_log_paths += glob.glob(f"{self.logs_dir}/runtime_env*.log")
+        for file_path in monitor_log_paths:
             if os.path.isfile(file_path) and file_path not in self.log_filenames:
                 worker_match = WORKER_LOG_PATTERN.match(file_path)
                 if worker_match:
@@ -329,7 +371,7 @@ class LogMonitor:
                     "task_name": file_info.task_name,
                 }
                 try:
-                    self.publisher.publish_logs(data)
+                    self.gcs_client.publish_logs(data)
                 except Exception:
                     logger.exception(f"Failed to publish log messages {data}")
                 anything_published = True
@@ -367,13 +409,6 @@ class LogMonitor:
                             ray_constants.LOG_PREFIX_JOB_ID, 1
                         )[1]
                     elif next_line.startswith(
-                        ray_constants.LOG_PREFIX_TASK_ATTEMPT_START
-                    ) or next_line.startswith(
-                        ray_constants.LOG_PREFIX_TASK_ATTEMPT_END
-                    ):
-                        # Ignore these magic tokens for task logs.
-                        pass
-                    elif next_line.startswith(
                         "Windows fatal exception: access violation"
                     ):
                         # We are suppressing the
@@ -404,7 +439,7 @@ class LogMonitor:
                     file_info.worker_pid = "raylet"
                 elif "/gcs_server" in filename:
                     file_info.worker_pid = "gcs_server"
-                elif "/monitor" in filename:
+                elif "/monitor" in filename or "event_AUTOSCALER" in filename:
                     file_info.worker_pid = "autoscaler"
                 elif "/runtime_env" in filename:
                     file_info.worker_pid = "runtime_env"
@@ -473,6 +508,12 @@ if __name__ == "__main__":
         "--gcs-address", required=False, type=str, help="The address (ip:port) of GCS."
     )
     parser.add_argument(
+        "--node-ip-address",
+        required=False,
+        type=str,
+        help="The IP address of the node.",
+    )
+    parser.add_argument(
         "--logging-level",
         required=False,
         type=str,
@@ -493,51 +534,86 @@ if __name__ == "__main__":
         type=str,
         default=ray_constants.LOG_MONITOR_LOG_FILE_NAME,
         help="Specify the name of log file, "
-        "log to stdout if set empty, default is "
+        "log to stderr if set empty, default is "
         f'"{ray_constants.LOG_MONITOR_LOG_FILE_NAME}"',
+    )
+    parser.add_argument(
+        "--session-dir",
+        required=True,
+        type=str,
+        help="Specify the path of the session directory used by Ray processes.",
     )
     parser.add_argument(
         "--logs-dir",
         required=True,
         type=str,
-        help="Specify the path of the temporary directory used by Ray processes.",
+        help="Specify the path of the log directory used by Ray processes.",
     )
     parser.add_argument(
         "--logging-rotate-bytes",
-        required=False,
+        required=True,
         type=int,
-        default=ray_constants.LOGGING_ROTATE_BYTES,
-        help="Specify the max bytes for rotating "
-        "log file, default is "
-        f"{ray_constants.LOGGING_ROTATE_BYTES} bytes.",
+        help="Specify the max bytes for rotating log file.",
     )
     parser.add_argument(
         "--logging-rotate-backup-count",
-        required=False,
+        required=True,
         type=int,
-        default=ray_constants.LOGGING_ROTATE_BACKUP_COUNT,
-        help="Specify the backup count of rotated log file, default is "
-        f"{ray_constants.LOGGING_ROTATE_BACKUP_COUNT}.",
+        help="Specify the backup count of rotated log file.",
     )
+    parser.add_argument(
+        "--stdout-filepath",
+        required=False,
+        default="",
+        type=str,
+        help="The filepath to dump log monitor stdout.",
+    )
+    parser.add_argument(
+        "--stderr-filepath",
+        required=False,
+        default="",
+        type=str,
+        help="The filepath to dump log monitor stderr.",
+    )
+
     args = parser.parse_args()
-    setup_component_logger(
+
+    # Disable log rotation for windows platform.
+    logging_rotation_bytes = args.logging_rotate_bytes if sys.platform != "win32" else 0
+    logging_rotation_backup_count = (
+        args.logging_rotate_backup_count if sys.platform != "win32" else 1
+    )
+    logging_params = dict(
         logging_level=args.logging_level,
         logging_format=args.logging_format,
         log_dir=args.logs_dir,
         filename=args.logging_filename,
-        max_bytes=args.logging_rotate_bytes,
-        backup_count=args.logging_rotate_backup_count,
+        max_bytes=logging_rotation_bytes,
+        backup_count=logging_rotation_backup_count,
+    )
+    logger = setup_component_logger(**logging_params)
+
+    # Setup stdout/stderr redirect files if redirection enabled
+    logging_utils.redirect_stdout_stderr_if_needed(
+        args.stdout_filepath,
+        args.stderr_filepath,
+        logging_rotation_bytes,
+        logging_rotation_backup_count,
     )
 
+    gcs_client = GcsClient(address=args.gcs_address)
     log_monitor = LogMonitor(
-        args.logs_dir, ray._raylet.GcsPublisher(address=args.gcs_address), is_proc_alive
+        args.node_ip_address,
+        args.logs_dir,
+        gcs_client,
+        is_proc_alive,
+        gcs_address=args.gcs_address,
     )
 
     try:
         log_monitor.run()
     except Exception as e:
         # Something went wrong, so push an error to all drivers.
-        gcs_publisher = ray._raylet.GcsPublisher(address=args.gcs_address)
         traceback_str = ray._private.utils.format_error_message(traceback.format_exc())
         message = (
             f"The log monitor on node {platform.node()} "
@@ -546,7 +622,7 @@ if __name__ == "__main__":
         ray._private.utils.publish_error_to_driver(
             ray_constants.LOG_MONITOR_DIED_ERROR,
             message,
-            gcs_publisher=gcs_publisher,
+            gcs_client=gcs_client,
         )
         logger.error(message)
         raise e

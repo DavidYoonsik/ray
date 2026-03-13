@@ -14,22 +14,17 @@
 
 #include "ray/common/scheduling/cluster_resource_data.h"
 
-#include "ray/common/bundle_spec.h"
-#include "ray/common/scheduling/scheduling_resources.h"
+#include <algorithm>
+#include <string>
 
 namespace ray {
-using namespace ::ray::scheduling;
-
-bool IsPredefinedResource(scheduling::ResourceID resource) {
-  return resource.ToInt() >= 0 && resource.ToInt() < PredefinedResourcesEnum_MAX;
-}
 
 /// Convert a map of resources to a ResourceRequest data structure.
 ResourceRequest ResourceMapToResourceRequest(
     const absl::flat_hash_map<std::string, double> &resource_map,
     bool requires_object_store_memory) {
   ResourceRequest res({}, requires_object_store_memory);
-  for (auto entry : resource_map) {
+  for (const auto &entry : resource_map) {
     res.Set(ResourceID(entry.first), FixedPoint(entry.second));
   }
   return res;
@@ -58,8 +53,8 @@ NodeResources ResourceMapToNodeResources(
     const absl::flat_hash_map<std::string, double> &resource_map_available,
     const absl::flat_hash_map<std::string, std::string> &node_labels) {
   NodeResources node_resources;
-  node_resources.total = ResourceMapToResourceRequest(resource_map_total, false);
-  node_resources.available = ResourceMapToResourceRequest(resource_map_available, false);
+  node_resources.total = NodeResourceSet(resource_map_total);
+  node_resources.available = NodeResourceSet(resource_map_available);
   node_resources.labels = node_labels;
   return node_resources;
 }
@@ -67,21 +62,19 @@ NodeResources ResourceMapToNodeResources(
 float NodeResources::CalculateCriticalResourceUtilization() const {
   float highest = 0;
   for (const auto &i : {CPU, MEM, OBJECT_STORE_MEM}) {
-    const auto &total = this->total.Get(ResourceID(i));
-    if (total == 0) {
+    const auto &cur_total = this->total.Get(ResourceID(i));
+    if (cur_total == 0) {
       continue;
     }
-    auto available = this->available.Get(ResourceID(i)).Double();
+    auto cur_available = this->available.Get(ResourceID(i)).Double();
     // Gcs scheduler handles the `normal_task_resources` specifically. So when calculating
     // the available resources, we have to take one more step to take that into account.
     // For raylet scheduling, the `normal_task_resources` is always empty.
     if (this->normal_task_resources.Has(ResourceID(i))) {
-      available -= this->normal_task_resources.Get(ResourceID(i)).Double();
-      if (available < 0) {
-        available = 0;
-      }
+      cur_available -= this->normal_task_resources.Get(ResourceID(i)).Double();
+      cur_available = std::max<float>(0, cur_available);
     }
-    float utilization = 1 - (available / total.Double());
+    float utilization = 1 - (cur_available / cur_total.Double());
     if (utilization > highest) {
       highest = utilization;
     }
@@ -97,16 +90,61 @@ bool NodeResources::IsAvailable(const ResourceRequest &resource_request,
     return false;
   }
 
+  const auto &label_selector = resource_request.GetLabelSelector();
+  if (!HasRequiredLabels(label_selector)) {
+    return false;
+  }
+
   if (!this->normal_task_resources.IsEmpty()) {
     auto available_resources = this->available;
     available_resources -= this->normal_task_resources;
-    return resource_request <= available_resources;
+    return available_resources >= resource_request.GetResourceSet();
   }
-  return resource_request <= this->available;
+  return this->available >= resource_request.GetResourceSet();
 }
 
 bool NodeResources::IsFeasible(const ResourceRequest &resource_request) const {
-  return resource_request <= this->total;
+  const auto &label_selector = resource_request.GetLabelSelector();
+  if (!HasRequiredLabels(label_selector)) {
+    return false;
+  }
+  return this->total >= resource_request.GetResourceSet();
+}
+
+bool NodeResources::HasRequiredLabels(const LabelSelector &label_selector) const {
+  // Check if node labels satisfy all label constraints
+  const auto &constraints = label_selector.GetConstraints();
+  for (const auto &constraint : constraints) {
+    if (!NodeLabelMatchesConstraint(constraint)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool NodeResources::NodeLabelMatchesConstraint(const LabelConstraint &constraint) const {
+  const auto &key = constraint.GetLabelKey();
+  const auto &match_operator = constraint.GetOperator();
+  const auto &values = constraint.GetLabelValues();
+
+  const auto &node_labels = this->labels;
+  if (match_operator == LabelSelectorOperator::LABEL_IN) {
+    // Check for equals or in() labels
+    if (node_labels.contains(key) && values.contains(node_labels.at(key))) {
+      return true;
+    }
+  } else if (match_operator == LabelSelectorOperator::LABEL_NOT_IN) {
+    // Check for not equals (!) or not in (!in()) labels
+    if (!(node_labels.contains(key) && values.contains(node_labels.at(key)))) {
+      return true;
+    }
+  } else {
+    RAY_CHECK(false)
+        << "Node label constraint operator type must be one of equals, not equals (!),"
+           "in、or not in (!in)";
+  }
+  return false;
 }
 
 bool NodeResources::operator==(const NodeResources &other) const {
@@ -120,59 +158,43 @@ bool NodeResources::operator!=(const NodeResources &other) const {
 
 std::string NodeResources::DebugString() const {
   std::stringstream buffer;
-  buffer << "{\"resources\":{";
-  bool first = true;
-  for (auto &resource_id : total.ResourceIds()) {
-    if (!first) {
-      buffer << ", ";
-    }
-    first = false;
-    buffer << resource_id.Binary() << ": " << available.Get(resource_id) << "/"
-           << total.Get(resource_id);
+  buffer << "{\"total\":" << total.DebugString();
+  buffer << "}, \"available\": " << available.DebugString();
+  buffer << "}, \"labels\":{";
+  for (const auto &[key, value] : labels) {
+    buffer << "\"" << key << "\":\"" << value << "\",";
   }
+  buffer << "}, \"is_draining\": " << is_draining;
+  buffer << ", \"draining_deadline_timestamp_ms\": " << draining_deadline_timestamp_ms
+         << "}";
+  return buffer.str();
+}
 
+std::string NodeResources::DictString() const { return DebugString(); }
+
+bool NodeResourceInstances::operator==(const NodeResourceInstances &other) const {
+  return this->total == other.total && this->available == other.available;
+}
+
+std::string NodeResourceInstances::DebugString() const {
+  std::stringstream buffer;
+  buffer << "{\"total\":" << total.DebugString();
+  buffer << "}, \"available\": " << available.DebugString();
   buffer << "}, \"labels\":{";
   for (const auto &[key, value] : labels) {
     buffer << "\"" << key << "\":\"" << value << "\",";
   }
   buffer << "}";
   return buffer.str();
-}
-
-std::string NodeResources::DictString() const { return DebugString(); }
-
-bool NodeResourceInstances::operator==(const NodeResourceInstances &other) {
-  return this->total == other.total && this->available == other.available;
-}
-
-std::string NodeResourceInstances::DebugString() const {
-  std::stringstream buffer;
-  buffer << "{";
-  bool first = true;
-  for (auto &resource_id : total.ResourceIds()) {
-    if (!first) {
-      buffer << ", ";
-    }
-    first = false;
-    buffer << resource_id.Binary() << ": "
-           << FixedPointVectorToString(available.Get(resource_id)) << "/"
-           << FixedPointVectorToString(total.Get(resource_id));
-  }
-  buffer << "}";
-  return buffer.str();
 };
 
-const TaskResourceInstances &NodeResourceInstances::GetAvailableResourceInstances()
+const NodeResourceInstanceSet &NodeResourceInstances::GetAvailableResourceInstances()
     const {
   return this->available;
 };
 
-const TaskResourceInstances &NodeResourceInstances::GetTotalResourceInstances() const {
+const NodeResourceInstanceSet &NodeResourceInstances::GetTotalResourceInstances() const {
   return this->total;
 };
-
-bool NodeResourceInstances::Contains(scheduling::ResourceID id) const {
-  return total.Has(id);
-}
 
 }  // namespace ray

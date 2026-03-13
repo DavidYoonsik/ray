@@ -8,9 +8,9 @@ by too many installed packages.
 It also ensures the correct Python version.
 """
 
-from typing import List
 import argparse
 import sys
+from typing import List
 
 # These are taken from `setup.py` for ray[default]
 DEFAULT_BLACKLIST = [
@@ -18,7 +18,6 @@ DEFAULT_BLACKLIST = [
     "aiohttp_cors",
     "colorful",
     "py-spy",
-    "gpustat",
     "opencensus",
     "prometheus_client",
     "smart_open",

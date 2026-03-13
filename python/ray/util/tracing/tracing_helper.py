@@ -19,6 +19,7 @@ from typing import (
     cast,
 )
 
+import ray
 import ray._private.worker
 from ray._private.inspect_util import (
     is_class_method,
@@ -75,16 +76,15 @@ class _OpenTelemetryProxy:
         try:
             return importlib.import_module(module)
         except ImportError:
-            if os.getenv("RAY_TRACING_ENABLED", "False").lower() in ["true", "1"]:
+            if _is_tracing_enabled():
                 raise ImportError(
-                    "Install opentelemetry with "
-                    "'pip install opentelemetry-api==1.0.0rc1' "
-                    "and 'pip install opentelemetry-sdk==1.0.0rc1' to enable "
-                    "tracing. See more at docs.ray.io/tracing.html"
+                    "Install OpenTelemetry with "
+                    "'pip install opentelemetry-api==1.34.1 opentelemetry-sdk==1.34.1 opentelemetry-exporter-otlp==1.34.1' "
+                    "to enable tracing. See the Ray documentation for details: "
+                    "https://docs.ray.io/en/latest/ray-observability/user-guides/ray-tracing.html#installation"
                 )
 
 
-_nameable = Union[str, Callable[..., Any]]
 _global_is_tracing_enabled = False
 _opentelemetry = None
 
@@ -95,7 +95,7 @@ def _is_tracing_enabled() -> bool:
     return _global_is_tracing_enabled
 
 
-def _enbale_tracing():
+def _enable_tracing():
     global _global_is_tracing_enabled, _opentelemetry
     _global_is_tracing_enabled = True
     _opentelemetry = _OpenTelemetryProxy()
@@ -192,14 +192,14 @@ def _use_context(
         _opentelemetry.context.detach(token)
 
 
-def _function_hydrate_span_args(func: Callable[..., Any]):
+def _function_hydrate_span_args(function_name: str):
     """Get the Attributes of the function that will be reported as attributes
     in the trace."""
     runtime_context = get_runtime_context()
 
     span_args = {
         "ray.remote": "function",
-        "ray.function": func,
+        "ray.function": function_name,
         "ray.pid": str(os.getpid()),
         "ray.job_id": runtime_context.get_job_id(),
         "ray.node_id": runtime_context.get_node_id(),
@@ -220,21 +220,18 @@ def _function_hydrate_span_args(func: Callable[..., Any]):
 
 def _function_span_producer_name(func: Callable[..., Any]) -> str:
     """Returns the function span name that has span kind of producer."""
-    args = _function_hydrate_span_args(func)
-    name = args["ray.function"]
-
-    return f"{name} ray.remote"
+    return f"{func} ray.remote"
 
 
 def _function_span_consumer_name(func: Callable[..., Any]) -> str:
     """Returns the function span name that has span kind of consumer."""
-    args = _function_hydrate_span_args(func)
-    name = args["ray.function"]
-
-    return f"{name} ray.remote_worker"
+    return f"{func} ray.remote_worker"
 
 
-def _actor_hydrate_span_args(class_: _nameable, method: _nameable):
+def _actor_hydrate_span_args(
+    class_: Union[str, Callable[..., Any]],
+    method: Union[str, Callable[..., Any]],
+):
     """Get the Attributes of the actor that will be reported as attributes
     in the trace."""
     if callable(class_):
@@ -243,7 +240,6 @@ def _actor_hydrate_span_args(class_: _nameable, method: _nameable):
         method = method.__name__
 
     runtime_context = get_runtime_context()
-
     span_args = {
         "ray.remote": "actor",
         "ray.actor_class": class_,
@@ -268,22 +264,30 @@ def _actor_hydrate_span_args(class_: _nameable, method: _nameable):
     return span_args
 
 
-def _actor_span_producer_name(class_: _nameable, method: _nameable) -> str:
+def _actor_span_producer_name(
+    class_: Union[str, Callable[..., Any]],
+    method: Union[str, Callable[..., Any]],
+) -> str:
     """Returns the actor span name that has span kind of producer."""
-    args = _actor_hydrate_span_args(class_, method)
-    assert args is not None
-    name = args["ray.function"]
+    if not isinstance(class_, str):
+        class_ = class_.__name__
+    if not isinstance(method, str):
+        method = method.__name__
 
-    return f"{name} ray.remote"
+    return f"{class_}.{method} ray.remote"
 
 
-def _actor_span_consumer_name(class_: _nameable, method: _nameable) -> str:
+def _actor_span_consumer_name(
+    class_: Union[str, Callable[..., Any]],
+    method: Union[str, Callable[..., Any]],
+) -> str:
     """Returns the actor span name that has span kind of consumer."""
-    args = _actor_hydrate_span_args(class_, method)
-    assert args is not None
-    name = args["ray.function"]
+    if not isinstance(class_, str):
+        class_ = class_.__name__
+    if not isinstance(method, str):
+        method = method.__name__
 
-    return f"{name} ray.remote_worker"
+    return f"{class_}.{method} ray.remote_worker"
 
 
 def _tracing_task_invocation(method):
@@ -324,18 +328,13 @@ def _inject_tracing_into_function(function):
     future execution of that function will include tracing.
     Use the provided trace context from kwargs.
     """
-    # Add _ray_trace_ctx to function signature
     if not _is_tracing_enabled():
         return function
 
-    setattr(
+    function.__signature__ = _add_param_to_signature(
         function,
-        "__signature__",
-        _add_param_to_signature(
-            function,
-            inspect.Parameter(
-                "_ray_trace_ctx", inspect.Parameter.KEYWORD_ONLY, default=None
-            ),
+        inspect.Parameter(
+            "_ray_trace_ctx", inspect.Parameter.KEYWORD_ONLY, default=None
         ),
     )
 
@@ -417,14 +416,12 @@ def _tracing_actor_method_invocation(method):
         **_kwargs: Any,
     ) -> Any:
         # If tracing feature flag is not on, perform a no-op
-        if not _is_tracing_enabled() or self._actor_ref()._ray_is_cross_language:
+        if not _is_tracing_enabled() or self._actor._ray_is_cross_language:
             if kwargs is not None:
                 assert "_ray_trace_ctx" not in kwargs
             return method(self, args, kwargs, *_args, **_kwargs)
 
-        class_name = (
-            self._actor_ref()._ray_actor_creation_function_descriptor.class_name
-        )
+        class_name = self._actor._ray_actor_creation_function_descriptor.class_name
         method_name = self._method_name
         assert "_ray_trace_ctx" not in _kwargs
 
@@ -437,7 +434,7 @@ def _tracing_actor_method_invocation(method):
             # Inject a _ray_trace_ctx as a dictionary
             kwargs["_ray_trace_ctx"] = _DictPropagator.inject_current_context()
 
-            span.set_attribute("ray.actor_id", self._actor_ref()._ray_actor_id.hex())
+            span.set_attribute("ray.actor_id", self._actor._ray_actor_id.hex())
 
             return method(self, args, kwargs, *_args, **_kwargs)
 
@@ -537,23 +534,40 @@ def _inject_tracing_into_class(_cls):
         if name == "__del__":
             continue
 
-        # Add _ray_trace_ctx to method signature
-        setattr(
-            method,
-            "__signature__",
-            _add_param_to_signature(
-                method,
-                inspect.Parameter(
-                    "_ray_trace_ctx", inspect.Parameter.KEYWORD_ONLY, default=None
-                ),
+        # If the method is already wrapped, we still need to set __signature__
+        # on the deeply unwrapped original. This is because cloudpickle doesn't
+        # preserve __signature__ attributes, and _ActorClassMethodMetadata.create
+        # uses inspect.unwrap which goes all the way to the original method.
+        unwrapped_method = inspect.unwrap(method)
+
+        # Add _ray_trace_ctx to the UNWRAPPED method's signature.
+        # This ensures inspect.unwrap() will find the signature.
+        # Note: We always set the signature, even if it was already set by a
+        # previous call, because the signature might have been lost during
+        # serialization/deserialization.
+        unwrapped_method.__signature__ = _add_param_to_signature(
+            unwrapped_method,
+            inspect.Parameter(
+                "_ray_trace_ctx", inspect.Parameter.KEYWORD_ONLY, default=None
             ),
         )
+
+        # If method was already wrapped by tracing (e.g., preserved through
+        # cloudpickle), don't re-wrap it. We use a custom marker attribute
+        # instead of __wrapped__ because __wrapped__ could be from any
+        # decorator, not just tracing.
+        if getattr(method, "__ray_tracing_wrapped__", False):
+            continue
 
         if inspect.iscoroutinefunction(method):
             # If the method was async, swap out sync wrapper into async
             wrapped_method = wraps(method)(async_span_wrapper(method))
         else:
             wrapped_method = wraps(method)(span_wrapper(method))
+
+        # Mark the wrapped method so we don't re-wrap it if this class
+        # is processed again (e.g., after cloudpickle round-trip).
+        wrapped_method.__ray_tracing_wrapped__ = True
 
         setattr(_cls, name, wrapped_method)
 

@@ -1,45 +1,70 @@
+import dataclasses
+import functools
 import logging
 import threading
-from collections import deque
 from contextlib import nullcontext
-from typing import Any, Callable, Iterator, List, Optional, Tuple, TypeVar, Union
+from typing import Any, Callable, Generic, Iterator, List, Optional, Tuple, TypeVar
 
 import ray
 from ray.actor import ActorHandle
 from ray.data._internal.batcher import Batcher, ShufflingBatcher
 from ray.data._internal.block_batching.interfaces import (
     Batch,
+    BatchMetadata,
     BlockPrefetcher,
     CollatedBatch,
 )
-from ray.data._internal.stats import DatasetPipelineStats, DatasetStats
+from ray.data._internal.stats import DatasetStats
 from ray.data.block import Block, BlockAccessor, DataBatch
 from ray.types import ObjectRef
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-T = TypeVar("T")
-U = TypeVar("U")
-
 logger = logging.getLogger(__name__)
+
+I = TypeVar("I")
+O = TypeVar("O")
+
+
+class _MappingIterator(Iterator[O], Generic[I, O]):
+    """Iterator that applies a transform function to each element.
+
+    Unlike a generator, local variables in __next__ go out of scope when the method
+    returns, avoiding holding references to yielded values.
+    """
+
+    def __init__(self, input_iter: Iterator[I], transform_fn: Callable[[I], O]):
+        self._input_iter = input_iter
+        self._transform_fn = transform_fn
+
+    def __iter__(self) -> "_MappingIterator[I, O]":
+        return self
+
+    def __next__(self) -> O:
+        return self._transform_fn(next(self._input_iter))
 
 
 def _calculate_ref_hits(refs: List[ObjectRef[Any]]) -> Tuple[int, int, int]:
     """Given a list of object references, returns how many are already on the local
     node, how many require fetching from another node, and how many have unknown
-    locations."""
+    locations. If `DataContext.get_current().enable_get_object_locations_for_metrics` is
+    False, this will return `(0, 0, 0)` as getting object locations is disabled."""
     current_node_id = ray.get_runtime_context().get_node_id()
 
-    locs = ray.experimental.get_object_locations(refs)
-    nodes: List[List[str]] = [loc["node_ids"] for loc in locs.values()]
-    hits = sum(current_node_id in node_ids for node_ids in nodes)
-    unknowns = sum(1 for node_ids in nodes if not node_ids)
-    misses = len(nodes) - hits - unknowns
-    return hits, misses, unknowns
+    ctx = ray.data.DataContext.get_current()
+    if ctx.enable_get_object_locations_for_metrics:
+        locs = ray.experimental.get_object_locations(refs)
+        nodes: List[List[str]] = [loc["node_ids"] for loc in locs.values()]
+        hits = sum(current_node_id in node_ids for node_ids in nodes)
+        unknowns = sum(1 for node_ids in nodes if not node_ids)
+        misses = len(nodes) - hits - unknowns
+        return hits, misses, unknowns
+
+    return 0, 0, 0
 
 
 def resolve_block_refs(
     block_ref_iter: Iterator[ObjectRef[Block]],
-    stats: Optional[Union[DatasetStats, DatasetPipelineStats]] = None,
+    stats: Optional[DatasetStats] = None,
 ) -> Iterator[Block]:
     """Resolves the block references for each logical batch.
 
@@ -71,96 +96,131 @@ def resolve_block_refs(
 
 def blocks_to_batches(
     block_iter: Iterator[Block],
-    stats: Optional[Union[DatasetStats, DatasetPipelineStats]] = None,
+    stats: Optional[DatasetStats] = None,
     batch_size: Optional[int] = None,
     drop_last: bool = False,
     shuffle_buffer_min_size: Optional[int] = None,
     shuffle_seed: Optional[int] = None,
     ensure_copy: bool = False,
 ) -> Iterator[Batch]:
-    """Given an iterator over blocks, returns an iterator over blocks
-    of the appropriate bacth size.
+    """Given an iterator over blocks, returns an iterator over batches."""
+    return _BatchingIterator(
+        block_iter,
+        stats=stats,
+        batch_size=batch_size,
+        drop_last=drop_last,
+        shuffle_buffer_min_size=shuffle_buffer_min_size,
+        shuffle_seed=shuffle_seed,
+        ensure_copy=ensure_copy,
+    )
 
-    If the shuffling configurations are specified, then the
-    output blocks contain shuffled data.
 
-    Args:
-        block_iter: An iterator over blocks.
-        stats: Dataset stats object used to store block batching time.
-        batch_size: Record batch size, or None to let the system pick.
-        drop_last: Whether to drop the last batch if it's incomplete.
-        shuffle_buffer_min_size: If non-None, the data will be randomly shuffled
-            using a local in-memory shuffle buffer, and this value will serve as the
-            minimum number of rows that must be in the local in-memory shuffle buffer in
-            order to yield a batch.
-        shuffle_seed: The seed to use for the local random shuffle.
-        ensure_copy: Whether batches are always copied from the underlying base
-            blocks (not zero-copy views).
+class _BatchingIterator(Iterator[Batch]):
+    """Iterator that converts blocks to batches.
 
-    Returns:
-        An iterator over blocks of the given size that are potentially shuffled.
+    Unlike a generator, local variables in __next__ go out of scope when the method
+    returns, avoiding holding references to yielded values.
     """
-    if shuffle_buffer_min_size is not None:
-        batcher = ShufflingBatcher(
-            batch_size=batch_size,
-            shuffle_buffer_min_size=shuffle_buffer_min_size,
-            shuffle_seed=shuffle_seed,
+
+    def __init__(
+        self,
+        block_iter: Iterator[Block],
+        stats: Optional[DatasetStats] = None,
+        batch_size: Optional[int] = None,
+        drop_last: bool = False,
+        shuffle_buffer_min_size: Optional[int] = None,
+        shuffle_seed: Optional[int] = None,
+        ensure_copy: bool = False,
+    ):
+        self._block_iter = block_iter
+        self._stats = stats
+        self._drop_last = drop_last
+        self._global_counter = 0
+        self._done_adding = False
+
+        if shuffle_buffer_min_size is not None:
+            self._batcher = ShufflingBatcher(
+                batch_size=batch_size,
+                shuffle_buffer_min_size=shuffle_buffer_min_size,
+                shuffle_seed=shuffle_seed,
+            )
+        else:
+            self._batcher = Batcher(batch_size=batch_size, ensure_copy=ensure_copy)
+
+    def __iter__(self) -> "_BatchingIterator":
+        return self
+
+    def __next__(self) -> Batch:
+        timer = self._stats.iter_next_batch_s.timer() if self._stats else nullcontext()
+
+        # Try to get a batch from current batcher state
+        while True:
+            can_yield = self._batcher.has_batch() or (
+                self._batcher.has_any() and self._done_adding and not self._drop_last
+            )
+
+            if can_yield:
+                with timer:
+                    next_batch = self._batcher.next_batch()
+
+                res = Batch(
+                    metadata=BatchMetadata(batch_idx=self._global_counter),
+                    data=next_batch,
+                )
+
+                self._global_counter += 1
+                return res
+
+            elif not self._done_adding:
+                # If can't yield try adding more blocks
+                try:
+                    # NOTE: Block ref is released immediately
+                    block = next(self._block_iter)
+                    self._batcher.add(block)
+                except StopIteration:
+                    self._batcher.done_adding()
+                    self._done_adding = True
+            else:
+                # In case when
+                #   - We've exhausted input AND
+                #   - There's nothing to yield anymore
+                #
+                # We stop the iteration
+                raise StopIteration
+
+
+def _format_batch(
+    batch: Batch,
+    batch_format: Optional[str],
+    stats: Optional[DatasetStats],
+) -> Batch:
+    with stats.iter_format_batch_s.timer() if stats else nullcontext():
+        formatted_data = BlockAccessor.for_block(batch.data).to_batch_format(
+            batch_format
         )
-    else:
-        batcher = Batcher(batch_size=batch_size, ensure_copy=ensure_copy)
-
-    def get_iter_next_batch_s_timer():
-        return stats.iter_next_batch_s.timer() if stats else nullcontext()
-
-    global_counter = 0
-
-    for block in block_iter:
-        batcher.add(block)
-        while batcher.has_batch():
-            with get_iter_next_batch_s_timer():
-                batch = batcher.next_batch()
-            yield Batch(global_counter, batch)
-            global_counter += 1
-
-    # Signal to the batcher that there are no more blocks to add.
-    batcher.done_adding()
-
-    # Get any leftover batches in ShufflingBatcher.
-    while batcher.has_batch():
-        with get_iter_next_batch_s_timer():
-            batch = batcher.next_batch()
-        yield Batch(global_counter, batch)
-        global_counter += 1
-
-    # Get any remaining data.
-    if not drop_last and batcher.has_any():
-        with get_iter_next_batch_s_timer():
-            batch = batcher.next_batch()
-        yield Batch(global_counter, batch)
-        global_counter += 1
+    return dataclasses.replace(batch, data=formatted_data)
 
 
 def format_batches(
-    block_iter: Iterator[Batch],
+    batch_iter: Iterator[Batch],
     batch_format: Optional[str],
-    stats: Optional[Union[DatasetStats, DatasetPipelineStats]] = None,
+    stats: Optional[DatasetStats] = None,
 ) -> Iterator[Batch]:
-    """Given an iterator of blocks, returns an iterator of formatted batches.
+    """Given an iterator of batches, returns an iterator of formatted batches."""
+    return _MappingIterator(
+        batch_iter,
+        functools.partial(_format_batch, batch_format=batch_format, stats=stats),
+    )
 
-    Args:
-        block_iter: An iterator over blocks.
-        batch_format: The batch format to use.
-        stats: An optional stats object to record formatting times.
 
-    Returns:
-        An iterator over batch index and the formatted batch.
-    """
-    for batch in block_iter:
-        with stats.iter_format_batch_s.timer() if stats else nullcontext():
-            formatted_batch = BlockAccessor.for_block(batch.data).to_batch_format(
-                batch_format
-            )
-        yield Batch(batch.batch_idx, formatted_batch)
+def _collate_batch(
+    batch: Batch,
+    collate_fn: Callable[[DataBatch], Any],
+    stats: Optional[DatasetStats],
+) -> CollatedBatch:
+    with stats.iter_collate_batch_s.timer() if stats else nullcontext():
+        collated_data = collate_fn(batch.data)
+    return CollatedBatch(metadata=batch.metadata, data=collated_data)
 
 
 def collate(
@@ -168,18 +228,24 @@ def collate(
     collate_fn: Optional[Callable[[DataBatch], Any]],
     stats: Optional[DatasetStats] = None,
 ) -> Iterator[CollatedBatch]:
-    """Returns an iterator with the provided collate_fn applied to items of the batch
-    iterator.
+    """Returns an iterator with the provided collate_fn applied to batches."""
+    if not isinstance(batch_iter, Iterator):
+        batch_iter = iter(batch_iter)
 
-    Args:
-        batch_iter: An iterator over formatted batches.
-        collate_fn: A function to apply to each batch.
-        stats: An optional stats object to record formatting times.
-    """
-    for batch in batch_iter:
-        with stats.iter_collate_batch_s.timer() if stats else nullcontext():
-            collated_batch = collate_fn(batch.data)
-        yield CollatedBatch(batch.batch_idx, collated_batch)
+    return _MappingIterator(
+        batch_iter,
+        functools.partial(_collate_batch, collate_fn=collate_fn, stats=stats),
+    )
+
+
+def _finalize_batch(
+    batch: CollatedBatch,
+    finalize_fn: Callable[[Any], Any],
+    stats: Optional[DatasetStats],
+) -> CollatedBatch:
+    with stats.iter_finalize_batch_s.timer() if stats else nullcontext():
+        finalized_data = finalize_fn(batch.data)
+    return dataclasses.replace(batch, data=finalized_data)
 
 
 def finalize_batches(
@@ -187,121 +253,14 @@ def finalize_batches(
     finalize_fn: Callable[[Any], Any],
     stats: Optional[DatasetStats] = None,
 ) -> Iterator[CollatedBatch]:
-    """Returns an iterator with the provided finalize_fn applied to items of the batch
-    iterator.
+    """Returns an iterator with finalize_fn applied to batches."""
+    if not isinstance(batch_iter, Iterator):
+        batch_iter = iter(batch_iter)
 
-    This is the same as `collate` except the input batches can be of type Any.
-
-    Args:
-        batch_iter: An iterator over processed batches.
-        finalize_fn: A function to apply to each batch.
-        stats: An optional stats object to record formatting times.
-
-    Returns:
-        An iterator over batch index and the finalized batch.
-    """
-    for batch in batch_iter:
-        with stats.iter_finalize_batch_s.timer() if stats else nullcontext():
-            finalized_batch = finalize_fn(batch.data)
-        yield CollatedBatch(batch.batch_idx, finalized_batch)
-
-
-def extract_data_from_batch(batch_iter: Iterator[Batch]) -> Iterator[Any]:
-    for batch in batch_iter:
-        yield batch.data
-
-
-def make_async_gen(
-    base_iterator: Iterator[T],
-    fn: Callable[[Iterator[T]], Iterator[U]],
-    num_workers: int = 1,
-) -> Iterator[U]:
-    """Returns a new iterator with elements fetched from the base_iterator
-    in an async fashion using a threadpool.
-
-    Each thread in the threadpool will fetch data from the base_iterator in a
-    thread-safe fashion, and apply the provided `fn` computation concurrently.
-
-    Args:
-        base_iterator: The iterator to asynchronously fetch from.
-        fn: The function to run on the input iterator.
-        num_workers: The number of threads to use in the threadpool. Defaults to 1.
-
-    Returns:
-        An iterator with the same elements as outputted from `fn`.
-    """
-
-    if num_workers < 1:
-        raise ValueError("Size of threadpool must be at least 1.")
-
-    # Use a lock to fetch from the base_iterator in a thread-safe fashion.
-    def convert_to_threadsafe_iterator(base_iterator: Iterator[T]) -> Iterator[T]:
-        class ThreadSafeIterator:
-            def __init__(self, it):
-                self.lock = threading.Lock()
-                self.it = it
-
-            def __next__(self):
-                with self.lock:
-                    return next(self.it)
-
-            def __iter__(self):
-                return self
-
-        return ThreadSafeIterator(base_iterator)
-
-    thread_safe_generator = convert_to_threadsafe_iterator(base_iterator)
-
-    class Sentinel:
-        def __init__(self, thread_index: int):
-            self.thread_index = thread_index
-
-    output_queue = Queue(1)
-
-    # Because pulling from the base iterator cannot happen concurrently,
-    # we must execute the expensive computation in a separate step which
-    # can be parallelized via a threadpool.
-    def execute_computation(thread_index: int):
-        try:
-            for item in fn(thread_safe_generator):
-                if output_queue.put(item):
-                    # Return early when it's instructed to do so.
-                    return
-            output_queue.put(Sentinel(thread_index))
-        except Exception as e:
-            output_queue.put(e)
-
-    # Use separate threads to produce output batches.
-    threads = [
-        threading.Thread(target=execute_computation, args=(i,), daemon=True)
-        for i in range(num_workers)
-    ]
-
-    for thread in threads:
-        thread.start()
-
-    # Use main thread to consume output batches.
-    num_threads_finished = 0
-    try:
-        while True:
-            next_item = output_queue.get()
-            if isinstance(next_item, Exception):
-                raise next_item
-            if isinstance(next_item, Sentinel):
-                logger.debug(f"Thread {next_item.thread_index} finished.")
-                num_threads_finished += 1
-            else:
-                yield next_item
-            if num_threads_finished >= num_workers:
-                break
-    finally:
-        # Cooperatively exit all producer threads.
-        # This is to avoid these daemon threads hanging there with holding batches in
-        # memory, which can cause GRAM OOM easily. This can happen when caller breaks
-        # in the middle of iteration.
-        num_threads_alive = num_workers - num_threads_finished
-        if num_threads_alive > 0:
-            output_queue.release(num_threads_alive)
+    return _MappingIterator(
+        batch_iter,
+        functools.partial(_finalize_batch, finalize_fn=finalize_fn, stats=stats),
+    )
 
 
 PREFETCHER_ACTOR_NAMESPACE = "ray.dataset"
@@ -322,21 +281,29 @@ class WaitBlockPrefetcher(BlockPrefetcher):
         self._thread.start()
 
     def _run(self):
-        while True:
+        while not self._stopped:
             try:
-                blocks_to_wait = []
                 with self._condition:
-                    if len(self._blocks) > 0:
-                        blocks_to_wait, self._blocks = self._blocks[:], []
-                    else:
-                        if self._stopped:
-                            return
-                        blocks_to_wait = []
+                    if len(self._blocks) == 0:
+                        # Park, waiting for notification that prefetching
+                        # should resume
                         self._condition.wait()
-                if len(blocks_to_wait) > 0:
-                    ray.wait(blocks_to_wait, num_returns=1, fetch_local=True)
+
+                    blocks_to_fetch, self._blocks = self._blocks[:], []
+
+                if len(blocks_to_fetch) > 0:
+                    ray.wait(
+                        blocks_to_fetch,
+                        num_returns=1,
+                        # NOTE: We deliberately setting timeout to 0 to avoid
+                        #       blocking the fetching thread unnecessarily
+                        timeout=0,
+                        fetch_local=True,
+                    )
             except Exception:
                 logger.exception("Error in prefetcher thread.")
+
+        logger.debug("Exiting prefetcher's background thread")
 
     def prefetch_blocks(self, blocks: List[ObjectRef[Block]]):
         with self._condition:
@@ -383,66 +350,3 @@ class _BlockPretcher:
 
     def prefetch(self, *blocks) -> None:
         pass
-
-
-class Queue:
-    """A thread-safe queue implementation for multiple producers and consumers.
-
-    Provide `release()` to exit producer threads cooperatively for resource release.
-    """
-
-    def __init__(self, queue_size: int):
-        # The queue shared across multiple producer threads.
-        self._queue = deque()
-        # The boolean varilable to indicate whether producer threads should exit.
-        self._threads_exit = False
-        # The semaphore for producer threads to put item into queue.
-        self._producer_semaphore = threading.Semaphore(queue_size)
-        # The semaphore for consumer threads to get item from queue.
-        self._consumer_semaphore = threading.Semaphore(0)
-        # The mutex lock to guard access of `self._queue` and `self._threads_exit`.
-        self._mutex = threading.Lock()
-
-    def put(self, item: Any) -> bool:
-        """Put an item into the queue.
-
-        Block if necessary until a free slot is available in queue.
-        This method is called by producer threads.
-
-        Returns:
-            True if the caller thread should exit immediately.
-        """
-        self._producer_semaphore.acquire()
-        with self._mutex:
-            if self._threads_exit:
-                return True
-            else:
-                self._queue.append(item)
-        self._consumer_semaphore.release()
-        return False
-
-    def get(self) -> Any:
-        """Remove and return an item from the queue.
-
-        Block if necessary until an item is available in queue.
-        This method is called by consumer threads.
-        """
-        self._consumer_semaphore.acquire()
-        with self._mutex:
-            next_item = self._queue.popleft()
-        self._producer_semaphore.release()
-        return next_item
-
-    def release(self, num_threads: int):
-        """Release `num_threads` of producers so they would exit cooperatively."""
-        with self._mutex:
-            self._threads_exit = True
-        for _ in range(num_threads):
-            # NOTE: After Python 3.9+, Semaphore.release(n) can be used to
-            # release all threads at once.
-            self._producer_semaphore.release()
-
-    def qsize(self):
-        """Return the size of the queue."""
-        with self._mutex:
-            return len(self._queue)

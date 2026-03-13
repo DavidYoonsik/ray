@@ -1,360 +1,127 @@
-import asyncio
-import concurrent.futures
-import threading
+import re
 
 import pytest
-import requests
-
-import ray
 
 from ray import serve
-from ray.serve.context import get_global_client
-from ray.serve.exceptions import RayServeException
-from ray.serve.handle import HandleOptions, RayServeHandle, RayServeSyncHandle
-from ray.serve._private.constants import (
-    DEPLOYMENT_NAME_PREFIX_SEPARATOR,
-    RAY_SERVE_ENABLE_EXPERIMENTAL_STREAMING,
-    SERVE_DEFAULT_APP_NAME,
+from ray._common.test_utils import SignalActor
+from ray.serve._private.common import OBJ_REF_NOT_SUPPORTED_ERROR
+from ray.serve._private.replica_result import (
+    ActorReplicaResult,
+    ReplicaResult,
+    gRPCReplicaResult,
 )
+from ray.serve.handle import DeploymentHandle
+from ray.serve.tests.conftest import *  # noqa
+from ray.serve.tests.conftest import _shared_serve_instance  # noqa
 
 
-def test_handle_options():
-    default_options = HandleOptions()
-    assert default_options.method_name == "__call__"
-    assert default_options.multiplexed_model_id == ""
-    assert default_options.stream is False
-
-    # Test setting method name.
-    only_set_method = default_options.copy_and_update(method_name="hi")
-    assert only_set_method.method_name == "hi"
-    assert only_set_method.multiplexed_model_id == ""
-    assert only_set_method.stream is False
-
-    # Existing options should be unmodified.
-    assert default_options.method_name == "__call__"
-    assert default_options.multiplexed_model_id == ""
-    assert default_options.stream is False
-
-    # Test setting model ID.
-    only_set_model_id = default_options.copy_and_update(multiplexed_model_id="hi")
-    assert only_set_model_id.method_name == "__call__"
-    assert only_set_model_id.multiplexed_model_id == "hi"
-    assert only_set_model_id.stream is False
-
-    # Existing options should be unmodified.
-    assert default_options.method_name == "__call__"
-    assert default_options.multiplexed_model_id == ""
-    assert default_options.stream is False
-
-    # Test setting stream.
-    only_set_stream = default_options.copy_and_update(stream=True)
-    assert only_set_stream.method_name == "__call__"
-    assert only_set_stream.multiplexed_model_id == ""
-    assert only_set_stream.stream is True
-
-    # Existing options should be unmodified.
-    assert default_options.method_name == "__call__"
-    assert default_options.multiplexed_model_id == ""
-    assert default_options.stream is False
-
-    # Test setting multiple.
-    set_multiple = default_options.copy_and_update(method_name="hi", stream=True)
-    assert set_multiple.method_name == "hi"
-    assert set_multiple.multiplexed_model_id == ""
-    assert set_multiple.stream is True
-
-
-@pytest.mark.asyncio
-async def test_async_handle_serializable(serve_instance):
-    @serve.deployment
-    def f():
-        return "hello"
-
-    f.deploy()
-
-    @ray.remote
-    class TaskActor:
-        async def task(self, handle):
-            ref = await handle.remote()
-            output = await ref
-            return output
-
-    # Test pickling via ray.remote()
-    handle = f.get_handle(sync=False)
-
-    task_actor = TaskActor.remote()
-    result = await task_actor.task.remote(handle)
-    assert result == "hello"
-
-
-def test_sync_handle_serializable(serve_instance):
-    @serve.deployment
-    def f():
-        return "hello"
-
-    handle = serve.run(f.bind())
-
-    @ray.remote
-    def task(handle):
-        return ray.get(handle.remote())
-
-    # Test pickling via ray.remote()
-    result_ref = task.remote(handle)
-    assert ray.get(result_ref) == "hello"
-
-
-def test_handle_serializable_in_deployment_init(serve_instance):
-    """Test that a handle can be passed into a constructor (#22110)"""
-
-    @serve.deployment
-    class RayServer1:
-        def __init__(self):
-            pass
-
-        def __call__(self, *args):
-            return {"count": self.count}
-
-    @serve.deployment
-    class RayServer2:
-        def __init__(self, handle):
-            self.handle = handle
-
-        def __call__(self, *args):
-            return {"count": self.count}
-
-    rs1 = RayServer1.bind()
-    rs2 = RayServer2.bind(rs1)
-    serve.run(rs2)
-
-
-def test_sync_handle_in_thread(serve_instance):
-    @serve.deployment
-    def f():
-        return "hello"
-
-    handle = serve.run(f.bind())
-
-    def thread_get_handle(deploy):
-        deployment_name = (
-            f"{SERVE_DEFAULT_APP_NAME}{DEPLOYMENT_NAME_PREFIX_SEPARATOR}{deploy._name}"
-        )
-        handle = get_global_client().get_handle(deployment_name, sync=True)
-        return handle
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        fut = executor.submit(thread_get_handle, f)
-        handle = fut.result()
-        assert ray.get(handle.remote()) == "hello"
-
-
-def test_handle_in_endpoint(serve_instance):
-    @serve.deployment
-    class Endpoint1:
-        def __call__(self, *args):
-            return "hello"
-
-    @serve.deployment
-    class Endpoint2:
-        def __init__(self, handle):
-            self.handle = handle
-
-        async def __call__(self, _):
-            return await (await self.handle.remote())
-
-    end_p1 = Endpoint1.bind()
-    end_p2 = Endpoint2.bind(end_p1)
-    serve.run(end_p2)
-
-    assert requests.get("http://127.0.0.1:8000/Endpoint2").text == "hello"
-
-
-@pytest.mark.skipif(
-    RAY_SERVE_ENABLE_EXPERIMENTAL_STREAMING, reason="Not supported w/ streaming."
+@pytest.mark.parametrize(
+    "by_reference,expected_result",
+    [(True, ActorReplicaResult), (False, gRPCReplicaResult)],
 )
-def test_handle_inject_starlette_request(serve_instance):
-    @serve.deployment(name="echo")
-    def echo_request_type(request):
-        return str(type(request))
+def test_init_by_reference(
+    serve_instance, by_reference: bool, expected_result: ReplicaResult
+):
+    @serve.deployment
+    def f():
+        return "hi"
 
-    echo_request_type.deploy()
+    h = serve.run(f.bind())
 
-    @serve.deployment(name="wrapper")
-    def wrapper_model(web_request):
-        handle = echo_request_type.get_handle()
-        return ray.get(handle.remote(web_request))
-
-    wrapper_model.deploy()
-
-    for route in ["echo", "wrapper"]:
-        resp = requests.get(f"http://127.0.0.1:8000/{route}")
-        request_type = resp.text
-        assert request_type == "<class 'starlette.requests.Request'>"
+    resp = h.options(_by_reference=by_reference).remote()
+    assert resp.result() == "hi"
+    assert isinstance(resp._replica_result, expected_result)
 
 
-def test_handle_option_chaining(serve_instance):
-    # https://github.com/ray-project/ray/issues/12802
-    # https://github.com/ray-project/ray/issues/12798
+@pytest.mark.timeout(60)
+async def test_by_reference_false_raises_error(serve_instance):
+    signal = SignalActor.remote()
 
     @serve.deployment
-    class MultiMethod:
-        def method_a(self):
-            return "method_a"
+    async def f():
+        await signal.wait.remote()
+        return "hi"
 
-        def method_b(self):
-            return "method_b"
+    h = serve.run(f.bind())
+    with pytest.raises(
+        RuntimeError, match=re.escape(OBJ_REF_NOT_SUPPORTED_ERROR.args[0])
+    ):
+        response = h.options(_by_reference=False).remote()
+        await response._to_object_ref()
 
-        def __call__(self):
-            return "__call__"
-
-    handle1 = serve.run(MultiMethod.bind())
-    assert ray.get(handle1.remote()) == "__call__"
-
-    handle2 = handle1.options(method_name="method_a")
-    assert ray.get(handle2.remote()) == "method_a"
-
-    handle3 = handle1.options(method_name="method_b")
-    assert ray.get(handle3.remote()) == "method_b"
+    await signal.send.remote()
 
 
-def test_repeated_get_handle_cached(serve_instance):
-    @serve.deployment
-    def f(_):
-        return ""
-
-    f.deploy()
-
-    handle_sets = {f.get_handle() for _ in range(100)}
-    assert len(handle_sets) == 1
-
-    handle_sets = {serve.get_deployment("f").get_handle() for _ in range(100)}
-    assert len(handle_sets) == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("sync", [True, False])
-async def test_args_kwargs(serve_instance, sync):
-    @serve.deployment
-    async def f(*args, **kwargs):
-        assert args[0] == "hi"
-        assert kwargs["kwarg1"] == 1
-        assert kwargs["kwarg2"] == "2"
-
-    f.deploy()
-
-    handle = f.get_handle(sync=sync)
-
-    def call():
-        return handle.remote("hi", kwarg1=1, kwarg2="2")
-
-    if sync:
-        obj_ref = call()
-    else:
-        obj_ref = await call()
-
-    ray.get(obj_ref)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("sync", [True, False])
-async def test_nonexistent_method(serve_instance, sync):
-    @serve.deployment
-    class A:
-        def exists(self):
-            pass
-
-    A.deploy()
-    handle = A.get_handle(sync=sync)
-
-    if sync:
-        obj_ref = handle.does_not_exist.remote()
-    else:
-        obj_ref = await handle.does_not_exist.remote()
-
-    with pytest.raises(RayServeException) as excinfo:
-        ray.get(obj_ref)
-
-    exception_string = str(excinfo.value)
-    assert "'does_not_exist'" in exception_string
-    assert "Available methods: ['exists']" in exception_string
-
-
-def _get_asyncio_loop_running_in_thread() -> asyncio.AbstractEventLoop:
-    loop = asyncio.new_event_loop()
-    threading.Thread(
-        daemon=True,
-        target=loop.run_forever,
-    ).start()
-    return loop
-
-
-@pytest.mark.asyncio
-async def test_handle_across_loops(serve_instance):
-    @serve.deployment
-    class A:
-        def exists(self):
-            return True
-
-    A.deploy()
-
-    async def refresh_get():
-        handle = A.get_handle(sync=False)
-        assert await (await handle.exists.remote())
-
-    for _ in range(10):
-        loop = _get_asyncio_loop_running_in_thread()
-        asyncio.run_coroutine_threadsafe(refresh_get(), loop).result()
-
-    handle = A.get_handle(sync=False)
-
-    async def cache_get():
-        assert await (await handle.exists.remote())
-
-    for _ in range(10):
-        loop = _get_asyncio_loop_running_in_thread()
-        asyncio.run_coroutine_threadsafe(refresh_get(), loop).result()
-
-
-def test_handle_typing(serve_instance):
-    @serve.deployment
-    class DeploymentClass:
-        pass
+@pytest.mark.parametrize("inner_by_reference", [True, False])
+@pytest.mark.parametrize("outer_by_reference", [True, False])
+def test_compose_deployments_in_app(
+    serve_instance, inner_by_reference, outer_by_reference
+):
+    """Test composing deployment handle refs within a deployment."""
 
     @serve.deployment
-    def deployment_func():
-        pass
+    class Downstream:
+        def __init__(self, msg: str):
+            self._msg = msg
+
+        def __call__(self, inp1: str, inp2: str):
+            return f"{self._msg}|{inp1}|{inp2}"
 
     @serve.deployment
-    class Ingress:
-        def __init__(
-            self, class_downstream: RayServeHandle, func_downstream: RayServeHandle
-        ):
-            # serve.run()'ing this deployment fails if these assertions fail.
-            assert isinstance(class_downstream, RayServeHandle)
-            assert isinstance(func_downstream, RayServeHandle)
+    class Deployment:
+        def __init__(self, handle1: DeploymentHandle, handle2: DeploymentHandle):
+            self._handle1 = handle1.options(_by_reference=outer_by_reference)
+            self._handle2 = handle2.options(_by_reference=inner_by_reference)
 
-    h = serve.run(Ingress.bind(DeploymentClass.bind(), deployment_func.bind()))
-    assert isinstance(h, RayServeSyncHandle)
+        async def __call__(self):
+            result = await self._handle1.remote(
+                self._handle2.remote("hi1", inp2="hi2"),
+                inp2=self._handle2.remote("hi3", inp2="hi4"),
+            )
+            return f"driver|{result}"
+
+    handle = serve.run(
+        Deployment.bind(
+            Downstream.options(name="downstream1").bind("downstream1"),
+            Downstream.options(name="downstream2").bind("downstream2"),
+        ),
+    )
+    assert (
+        handle.remote().result()
+        == "driver|downstream1|downstream2|hi1|hi2|downstream2|hi3|hi4"
+    )
 
 
-def test_call_function_with_argument(serve_instance):
+@pytest.mark.parametrize("inner_by_reference", [True, False])
+@pytest.mark.parametrize("outer_by_reference", [True, False])
+def test_compose_apps(serve_instance, inner_by_reference, outer_by_reference):
+    """Test composing deployment handle refs outside of a deployment."""
+
     @serve.deployment
-    def echo(name: str):
-        return f"Hi {name}"
+    class Deployment:
+        def __init__(self, msg: str):
+            self._msg = msg
 
-    @serve.deployment
-    class Ingress:
-        def __init__(self, h: RayServeHandle):
-            self._h = h
+        def __call__(self, inp1: str, inp2: str):
+            return f"{self._msg}|{inp1}|{inp2}"
 
-        async def __call__(self, name: str):
-            return await (await self._h.remote(name))
+    handle1 = serve.run(
+        Deployment.bind("app1"), name="app1", route_prefix="/app1"
+    ).options(_by_reference=outer_by_reference)
+    handle2 = serve.run(
+        Deployment.bind("app2"), name="app2", route_prefix="/app2"
+    ).options(_by_reference=inner_by_reference)
 
-    h = serve.run(Ingress.bind(echo.bind()))
-    assert ray.get(h.remote("sned")) == "Hi sned"
+    assert (
+        handle1.remote(
+            handle2.remote("hi1", inp2="hi2"),
+            inp2=handle2.remote("hi3", inp2="hi4"),
+        ).result()
+        == "app1|app2|hi1|hi2|app2|hi3|hi4"
+    )
 
 
 if __name__ == "__main__":
     import sys
-    import pytest
 
     sys.exit(pytest.main(["-v", "-s", __file__]))

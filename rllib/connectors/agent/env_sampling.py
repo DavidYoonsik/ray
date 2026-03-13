@@ -5,11 +5,11 @@ from ray.rllib.connectors.connector import (
     ConnectorContext,
 )
 from ray.rllib.connectors.registry import register_connector
+from ray.rllib.utils.annotations import OldAPIStack
 from ray.rllib.utils.typing import AgentConnectorDataType
-from ray.util.annotations import PublicAPI
 
 
-@PublicAPI(stability="alpha")
+@OldAPIStack
 class EnvSamplingAgentConnector(AgentConnector):
     def __init__(self, ctx: ConnectorContext, sign=False, limit=None):
         super().__init__(ctx)

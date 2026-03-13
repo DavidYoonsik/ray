@@ -1,28 +1,24 @@
-from typing import Optional
-
 import tree
 
+from ray.rllib.core.columns import Columns
 from ray.rllib.core.models.base import (
-    Encoder,
-    ActorCriticEncoder,
-    StatefulActorCriticEncoder,
-    STATE_IN,
-    STATE_OUT,
     ENCODER_OUT,
+    ActorCriticEncoder,
+    Encoder,
+    Model,
+    StatefulActorCriticEncoder,
+    tokenize,
 )
-from ray.rllib.core.models.base import Model, tokenize
 from ray.rllib.core.models.configs import (
     ActorCriticEncoderConfig,
     CNNEncoderConfig,
     MLPEncoderConfig,
+    MultiStreamEncoderConfig,
     RecurrentEncoderConfig,
 )
-from ray.rllib.core.models.specs.specs_base import Spec
-from ray.rllib.core.models.specs.specs_base import TensorSpec
-from ray.rllib.core.models.specs.specs_dict import SpecDict
 from ray.rllib.core.models.torch.base import TorchModel
-from ray.rllib.core.models.torch.primitives import TorchMLP, TorchCNN
-from ray.rllib.policy.sample_batch import SampleBatch
+from ray.rllib.core.models.torch.primitives import TorchCNN, TorchMLP
+from ray.rllib.models.utils import get_activation_fn, get_initializer_fn
 from ray.rllib.utils.annotations import override
 from ray.rllib.utils.framework import try_import_torch
 
@@ -61,34 +57,29 @@ class TorchMLPEncoder(TorchModel, Encoder):
             hidden_layer_activation=config.hidden_layer_activation,
             hidden_layer_use_layernorm=config.hidden_layer_use_layernorm,
             hidden_layer_use_bias=config.hidden_layer_use_bias,
+            hidden_layer_weights_initializer=config.hidden_layer_weights_initializer,
+            hidden_layer_weights_initializer_config=(
+                config.hidden_layer_weights_initializer_config
+            ),
+            hidden_layer_bias_initializer=config.hidden_layer_bias_initializer,
+            hidden_layer_bias_initializer_config=(
+                config.hidden_layer_bias_initializer_config
+            ),
             output_dim=config.output_layer_dim,
             output_activation=config.output_layer_activation,
             output_use_bias=config.output_layer_use_bias,
-        )
-
-    @override(Model)
-    def get_input_specs(self) -> Optional[Spec]:
-        return SpecDict(
-            {
-                SampleBatch.OBS: TensorSpec(
-                    "b, d", d=self.config.input_dims[0], framework="torch"
-                ),
-            }
-        )
-
-    @override(Model)
-    def get_output_specs(self) -> Optional[Spec]:
-        return SpecDict(
-            {
-                ENCODER_OUT: TensorSpec(
-                    "b, d", d=self.config.output_dims[0], framework="torch"
-                ),
-            }
+            output_layer_use_layernorm=config.output_layer_use_layernorm,
+            output_weights_initializer=config.output_layer_weights_initializer,
+            output_weights_initializer_config=(
+                config.output_layer_weights_initializer_config
+            ),
+            output_bias_initializer=config.output_layer_bias_initializer,
+            output_bias_initializer_config=config.output_layer_bias_initializer_config,
         )
 
     @override(Model)
     def _forward(self, inputs: dict, **kwargs) -> dict:
-        return {ENCODER_OUT: self.net(inputs[SampleBatch.OBS])}
+        return {ENCODER_OUT: self.net(inputs[Columns.OBS])}
 
 
 class TorchCNNEncoder(TorchModel, Encoder):
@@ -104,6 +95,10 @@ class TorchCNNEncoder(TorchModel, Encoder):
             cnn_activation=config.cnn_activation,
             cnn_use_layernorm=config.cnn_use_layernorm,
             cnn_use_bias=config.cnn_use_bias,
+            cnn_kernel_initializer=config.cnn_kernel_initializer,
+            cnn_kernel_initializer_config=config.cnn_kernel_initializer_config,
+            cnn_bias_initializer=config.cnn_bias_initializer,
+            cnn_bias_initializer_config=config.cnn_bias_initializer_config,
         )
         layers.append(cnn)
 
@@ -115,40 +110,8 @@ class TorchCNNEncoder(TorchModel, Encoder):
         self.net = nn.Sequential(*layers)
 
     @override(Model)
-    def get_input_specs(self) -> Optional[Spec]:
-        return SpecDict(
-            {
-                SampleBatch.OBS: TensorSpec(
-                    "b, w, h, c",
-                    w=self.config.input_dims[0],
-                    h=self.config.input_dims[1],
-                    c=self.config.input_dims[2],
-                    framework="torch",
-                ),
-            }
-        )
-
-    @override(Model)
-    def get_output_specs(self) -> Optional[Spec]:
-        return SpecDict(
-            {
-                ENCODER_OUT: (
-                    TensorSpec("b, d", d=self.config.output_dims[0], framework="torch")
-                    if self.config.flatten_at_end
-                    else TensorSpec(
-                        "b, w, h, c",
-                        w=self.config.output_dims[0],
-                        h=self.config.output_dims[1],
-                        d=self.config.output_dims[2],
-                        framework="torch",
-                    )
-                )
-            }
-        )
-
-    @override(Model)
     def _forward(self, inputs: dict, **kwargs) -> dict:
-        return {ENCODER_OUT: self.net(inputs[SampleBatch.OBS])}
+        return {ENCODER_OUT: self.net(inputs[Columns.OBS])}
 
 
 class TorchGRUEncoder(TorchModel, Encoder):
@@ -157,7 +120,6 @@ class TorchGRUEncoder(TorchModel, Encoder):
     This encoder has...
     - Zero or one tokenizers.
     - One or more GRU layers.
-    - One linear output layer.
     """
 
     def __init__(self, config: RecurrentEncoderConfig) -> None:
@@ -175,7 +137,14 @@ class TorchGRUEncoder(TorchModel, Encoder):
         assert len(gru_input_dims) == 1
         gru_input_dim = gru_input_dims[0]
 
-        # Create the torch LSTM layer.
+        gru_weights_initializer = get_initializer_fn(
+            config.hidden_weights_initializer, framework="torch"
+        )
+        gru_bias_initializer = get_initializer_fn(
+            config.hidden_bias_initializer, framework="torch"
+        )
+
+        # Create the torch GRU layer.
         self.gru = nn.GRU(
             gru_input_dim,
             config.hidden_dim,
@@ -184,44 +153,16 @@ class TorchGRUEncoder(TorchModel, Encoder):
             bias=config.use_bias,
         )
 
-    @override(Model)
-    def get_input_specs(self) -> Optional[Spec]:
-        return SpecDict(
-            {
-                # b, t for batch major; t, b for time major.
-                SampleBatch.OBS: TensorSpec(
-                    "b, t, d",
-                    d=self.config.input_dims[0],
-                    framework="torch",
-                ),
-                STATE_IN: {
-                    "h": TensorSpec(
-                        "b, l, h",
-                        h=self.config.hidden_dim,
-                        l=self.config.num_layers,
-                        framework="torch",
-                    ),
-                },
-            }
-        )
-
-    @override(Model)
-    def get_output_specs(self) -> Optional[Spec]:
-        return SpecDict(
-            {
-                ENCODER_OUT: TensorSpec(
-                    "b, t, d", d=self.config.output_dims[0], framework="torch"
-                ),
-                STATE_OUT: {
-                    "h": TensorSpec(
-                        "b, l, h",
-                        h=self.config.hidden_dim,
-                        l=self.config.num_layers,
-                        framework="torch",
-                    ),
-                },
-            }
-        )
+        # Initialize, GRU weights, if necessary.
+        if gru_weights_initializer:
+            gru_weights_initializer(
+                self.gru.weight, **config.hidden_weights_initializer_config or {}
+            )
+        # Initialize GRU bias, if necessary.
+        if gru_bias_initializer:
+            gru_bias_initializer(
+                self.gru.weight, **config.hidden_bias_initializer_config or {}
+            )
 
     @override(Model)
     def get_initial_state(self):
@@ -238,17 +179,21 @@ class TorchGRUEncoder(TorchModel, Encoder):
             out = tokenize(self.tokenizer, inputs, framework="torch")
         else:
             # Otherwise, just use the raw observations.
-            out = inputs[SampleBatch.OBS].float()
+            out = inputs[Columns.OBS].float()
 
         # States are batch-first when coming in. Make them layers-first.
-        states_in = tree.map_structure(lambda s: s.transpose(0, 1), inputs[STATE_IN])
+        states_in = tree.map_structure(
+            lambda s: s.transpose(0, 1), inputs[Columns.STATE_IN]
+        )
 
         out, states_out = self.gru(out, states_in["h"])
         states_out = {"h": states_out}
 
         # Insert them into the output dict.
         outputs[ENCODER_OUT] = out
-        outputs[STATE_OUT] = tree.map_structure(lambda s: s.transpose(0, 1), states_out)
+        outputs[Columns.STATE_OUT] = tree.map_structure(
+            lambda s: s.transpose(0, 1), states_out
+        )
         return outputs
 
 
@@ -258,7 +203,6 @@ class TorchLSTMEncoder(TorchModel, Encoder):
     This encoder has...
     - Zero or one tokenizers.
     - One or more LSTM layers.
-    - One linear output layer.
     """
 
     def __init__(self, config: RecurrentEncoderConfig) -> None:
@@ -276,6 +220,13 @@ class TorchLSTMEncoder(TorchModel, Encoder):
         assert len(lstm_input_dims) == 1
         lstm_input_dim = lstm_input_dims[0]
 
+        lstm_weights_initializer = get_initializer_fn(
+            config.hidden_weights_initializer, framework="torch"
+        )
+        lstm_bias_initializer = get_initializer_fn(
+            config.hidden_bias_initializer, framework="torch"
+        )
+
         # Create the torch LSTM layer.
         self.lstm = nn.LSTM(
             lstm_input_dim,
@@ -285,54 +236,22 @@ class TorchLSTMEncoder(TorchModel, Encoder):
             bias=config.use_bias,
         )
 
-    @override(Model)
-    def get_input_specs(self) -> Optional[Spec]:
-        return SpecDict(
-            {
-                # b, t for batch major; t, b for time major.
-                SampleBatch.OBS: TensorSpec(
-                    "b, t, d", d=self.config.input_dims[0], framework="torch"
-                ),
-                STATE_IN: {
-                    "h": TensorSpec(
-                        "b, l, h",
-                        h=self.config.hidden_dim,
-                        l=self.config.num_layers,
-                        framework="torch",
-                    ),
-                    "c": TensorSpec(
-                        "b, l, h",
-                        h=self.config.hidden_dim,
-                        l=self.config.num_layers,
-                        framework="torch",
-                    ),
-                },
-            }
-        )
-
-    @override(Model)
-    def get_output_specs(self) -> Optional[Spec]:
-        return SpecDict(
-            {
-                ENCODER_OUT: TensorSpec(
-                    "b, t, d", d=self.config.output_dims[0], framework="torch"
-                ),
-                STATE_OUT: {
-                    "h": TensorSpec(
-                        "b, l, h",
-                        h=self.config.hidden_dim,
-                        l=self.config.num_layers,
-                        framework="torch",
-                    ),
-                    "c": TensorSpec(
-                        "b, l, h",
-                        h=self.config.hidden_dim,
-                        l=self.config.num_layers,
-                        framework="torch",
-                    ),
-                },
-            }
-        )
+        # Initialize LSTM layer weigths and biases, if necessary.
+        for layer in self.lstm.all_weights:
+            if lstm_weights_initializer:
+                lstm_weights_initializer(
+                    layer[0], **config.hidden_weights_initializer_config or {}
+                )
+                lstm_weights_initializer(
+                    layer[1], **config.hidden_weights_initializer_config or {}
+                )
+            if lstm_bias_initializer:
+                lstm_bias_initializer(
+                    layer[2], **config.hidden_bias_initializer_config or {}
+                )
+                lstm_bias_initializer(
+                    layer[3], **config.hidden_bias_initializer_config or {}
+                )
 
     @override(Model)
     def get_initial_state(self):
@@ -350,15 +269,159 @@ class TorchLSTMEncoder(TorchModel, Encoder):
             out = tokenize(self.tokenizer, inputs, framework="torch")
         else:
             # Otherwise, just use the raw observations.
-            out = inputs[SampleBatch.OBS].float()
+            out = inputs[Columns.OBS].float()
 
         # States are batch-first when coming in. Make them layers-first.
-        states_in = tree.map_structure(lambda s: s.transpose(0, 1), inputs[STATE_IN])
+        states_in = tree.map_structure(
+            lambda s: s.transpose(0, 1), inputs[Columns.STATE_IN]
+        )
 
         out, states_out = self.lstm(out, (states_in["h"], states_in["c"]))
         states_out = {"h": states_out[0], "c": states_out[1]}
 
         # Insert them into the output dict.
         outputs[ENCODER_OUT] = out
-        outputs[STATE_OUT] = tree.map_structure(lambda s: s.transpose(0, 1), states_out)
+        outputs[Columns.STATE_OUT] = tree.map_structure(
+            lambda s: s.transpose(0, 1), states_out
+        )
         return outputs
+
+
+class TorchMultiStreamEncoder(TorchModel, Encoder):
+    """An encoder that encodes multiple input streams separately.
+
+    Each input stream is encoded with its own encoder defined in
+    `base_encoder_configs`. The resulting embeddings are concatenated and
+    passed through a final fusion network to produce the output embedding.
+    """
+
+    def __init__(self, config: MultiStreamEncoderConfig) -> None:
+        TorchModel.__init__(self, config)
+        Encoder.__init__(self, config)
+
+        # Create the neural network for observation stream.
+        self.base_encoders = nn.ModuleDict(
+            {
+                k: cfg.build(framework="torch")
+                for k, cfg in sorted(config.base_encoder_configs.items())
+            }
+        )
+
+        # Get activation functions.
+        self.hidden_activation = (
+            get_activation_fn(config.hidden_layer_activation, framework="torch")
+            or nn.Identity
+        )
+
+        # Calculate total embed dim.
+        self._total_embed_dim = sum(
+            cfg.output_dims[0] for cfg in config.base_encoder_configs.values()
+        )
+
+        # Build fusion layers (hidden layers with skip connections).
+        fusion_layers = []
+        if config.hidden_layer_dims:
+            # Input layer: total_embed_dim -> hidden_layer_dims[0]
+            input_layer = nn.Linear(
+                self._total_embed_dim,
+                config.hidden_layer_dims[0],
+                bias=config.hidden_layer_use_bias,
+            )
+            fusion_layers.append(input_layer)
+
+            # Intermediate fusion layers with skip connections.
+            for i in range(1, len(config.hidden_layer_dims)):
+                fusion_layers.append(
+                    nn.Linear(
+                        config.hidden_layer_dims[i - 1] + self._total_embed_dim,
+                        config.hidden_layer_dims[i],
+                        bias=config.hidden_layer_use_bias,
+                    )
+                )
+
+            # Initialize hidden layer weights if necessary.
+            if config.hidden_layer_weights_initializer:
+                hidden_weights_initializer = get_initializer_fn(
+                    config.hidden_layer_weights_initializer, framework="torch"
+                )
+                for layer in fusion_layers:
+                    hidden_weights_initializer(
+                        layer.weight,
+                        **config.hidden_layer_weights_initializer_config or {}
+                    )
+            # Initialize hidden layer bias if necessary.
+            if config.hidden_layer_bias_initializer:
+                hidden_bias_initializer = get_initializer_fn(
+                    config.hidden_layer_bias_initializer, framework="torch"
+                )
+                for layer in fusion_layers:
+                    hidden_bias_initializer(
+                        layer.bias, **config.hidden_layer_bias_initializer_config or {}
+                    )
+
+        self.fusion_layers = nn.ModuleList(fusion_layers)
+
+        # Build output layer only if output_layer_dim is defined.
+        self.output_layer = None
+        if config.output_layer_dim is not None:
+            # Get output activation function.
+            self.output_activation = (
+                get_activation_fn(config.output_layer_activation, framework="torch")
+                or nn.Identity
+            )
+            # Determine input dim for output layer.
+            if config.hidden_layer_dims:
+                output_input_dim = config.hidden_layer_dims[-1] + self._total_embed_dim
+            else:
+                output_input_dim = self._total_embed_dim
+
+            self.output_layer = nn.Linear(
+                output_input_dim,
+                config.output_layer_dim,
+                bias=config.output_layer_use_bias,
+            )
+
+            # Initialize output layer weights if necessary.
+            if config.output_layer_weights_initializer:
+                output_weights_initializer = get_initializer_fn(
+                    config.output_layer_weights_initializer, framework="torch"
+                )
+                output_weights_initializer(
+                    self.output_layer.weight,
+                    **config.output_layer_weights_initializer_config or {}
+                )
+            # Initialize output layer bias if necessary.
+            if config.output_layer_bias_initializer:
+                output_bias_initializer = get_initializer_fn(
+                    config.output_layer_bias_initializer, framework="torch"
+                )
+                output_bias_initializer(
+                    self.output_layer.bias,
+                    **config.output_layer_bias_initializer_config or {}
+                )
+
+    @override(Model)
+    def _forward(self, inputs, **kwargs):
+        # Run the inputs through the base encoders.
+        keys = sorted(self.config.base_encoder_configs.keys())
+        encoder_outs = [
+            self.base_encoders[k]({Columns.OBS: inputs[k]})[ENCODER_OUT] for k in keys
+        ]
+        # Concatenate the embeddings.
+        embeds = torch.cat(encoder_outs, dim=-1)
+
+        # Pass through fusion layers (if any).
+        out = embeds
+        if self.fusion_layers:
+            out = self.hidden_activation()(self.fusion_layers[0](embeds))
+            for layer in self.fusion_layers[1:]:
+                out = self.hidden_activation()(layer(torch.cat([out, embeds], dim=-1)))
+
+        # Pass through output layer (if defined).
+        if self.output_layer is not None:
+            # Concatenate with skip connection if we have fusion layers.
+            if self.fusion_layers:
+                out = torch.cat([out, embeds], dim=-1)
+            out = self.output_activation()(self.output_layer(out))
+
+        return {ENCODER_OUT: out}

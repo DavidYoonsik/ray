@@ -15,6 +15,9 @@
 				"working_dir": {
 					"type": "string"
 				},
+				"repeated_run": {
+					"type": "integer"
+				},
 				"env": {
 					"type": "string"
 				},
@@ -24,19 +27,20 @@
 				"python": {
 					"type": "string",
 					"enum": [
-						"3.7",
-						"3.8",
-						"3.9"
+						"3.10",
+						"3.11",
+						"3.12",
+						"3.13"
 					]
 				},
 				"frequency": {
 					"type": "string",
 					"enum": [
 						"manual",
-						"multi",
 						"nightly",
 						"nightly-3x",
-						"weekly"
+						"weekly",
+						"monthly"
 					]
 				},
 				"team": {
@@ -69,7 +73,7 @@
 			"type": "object",
 			"additionalProperties": false,
 			"properties": {
-				"cluster_env": {
+				"ray_version": {
 					"type": "string"
 				},
 				"cluster_compute": {
@@ -82,7 +86,7 @@
 				"cloud_id": {
 					"type": "string"
 				},
-				"cloud_name": {
+				"project_id": {
 					"type": "string"
 				},
 				"byod": {
@@ -90,8 +94,7 @@
 				}
 			},
 			"required": [
-				"cluster_compute",
-				"cluster_env"
+				"cluster_compute"
 			],
 			"title": "Cluster"
 		},
@@ -100,25 +103,19 @@
 			"additionalProperties": false,
 			"properties": {
 				"type": {
-					"type": "string",
-					"enum": [
-						"cpu",
-						"gpu",
-						"cu118"
-					]
-				},
-				"post_build_script":{
 					"type": "string"
 				},
-				"pip": {
-					"type": "array"
+				"post_build_script": {
+					"type": "string"
+				},
+				"python_depset": {
+					"type": "string"
 				},
 				"runtime_env": {
 					"type": "array"
 				}
 			},
-			"required": [
-			],
+			"required": [],
 			"title": "Byod"
 		},
 		"Run": {
@@ -155,6 +152,9 @@
 				},
 				"artifact_path": {
 					"type": "string"
+				},
+				"num_retries": {
+					"type": "integer"
 				}
 			},
 			"required": [
@@ -203,10 +203,10 @@
 					"type": "string",
 					"enum": [
 						"manual",
-						"multi",
 						"nightly",
 						"nightly-3x",
-						"weekly"
+						"weekly",
+						"monthly"
 					]
 				}
 			},

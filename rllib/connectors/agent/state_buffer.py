@@ -1,30 +1,28 @@
-from collections import defaultdict
 import logging
 import pickle
+from collections import defaultdict
 from typing import Any
 
 import numpy as np
-from ray.rllib.utils.annotations import override
 import tree  # dm_tree
 
+from ray import cloudpickle
 from ray.rllib.connectors.connector import (
     AgentConnector,
     Connector,
     ConnectorContext,
 )
-from ray import cloudpickle
 from ray.rllib.connectors.registry import register_connector
+from ray.rllib.core.columns import Columns
 from ray.rllib.policy.sample_batch import SampleBatch
-from ray.rllib.core.models.base import STATE_OUT
+from ray.rllib.utils.annotations import OldAPIStack, override
 from ray.rllib.utils.spaces.space_utils import get_base_struct_from_space
 from ray.rllib.utils.typing import ActionConnectorDataType, AgentConnectorDataType
-from ray.util.annotations import PublicAPI
-
 
 logger = logging.getLogger(__name__)
 
 
-@PublicAPI(stability="alpha")
+@OldAPIStack
 class StateBufferConnector(AgentConnector):
     def __init__(self, ctx: ConnectorContext, states: Any = None):
         super().__init__(ctx)
@@ -33,7 +31,7 @@ class StateBufferConnector(AgentConnector):
         self._action_space_struct = get_base_struct_from_space(ctx.action_space)
 
         self._states = defaultdict(lambda: defaultdict(lambda: (None, None, None)))
-        self._enable_rl_module_api = ctx.config.get("_enable_rl_module_api", False)
+        self._enable_new_api_stack = False
         # TODO(jungong) : we would not need this if policies are never stashed
         # during the rollout of a single episode.
         if states:
@@ -65,7 +63,7 @@ class StateBufferConnector(AgentConnector):
     def transform(self, ac_data: AgentConnectorDataType) -> AgentConnectorDataType:
         d = ac_data.data
         assert (
-            type(d) == dict
+            type(d) is dict
         ), "Single agent data must be of type Dict[str, TensorStructType]"
 
         env_id = ac_data.env_id
@@ -89,9 +87,9 @@ class StateBufferConnector(AgentConnector):
 
         if states is None:
             states = self._initial_states
-        if self._enable_rl_module_api:
+        if self._enable_new_api_stack:
             if states:
-                d[STATE_OUT] = states
+                d[Columns.STATE_OUT] = states
         else:
             for i, v in enumerate(states):
                 d["state_out_{}".format(i)] = v

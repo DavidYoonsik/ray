@@ -1,8 +1,8 @@
 import requests
 
 # __doc_import_begin__
-import ray
 from ray import serve
+from ray.serve.handle import DeploymentHandle
 from ray.serve.gradio_integrations import GradioIngress
 
 import gradio as gr
@@ -35,15 +35,18 @@ app2 = TextGenerationModel.bind("distilgpt2")
 # __doc_gradio_server_begin__
 @serve.deployment
 class MyGradioServer(GradioIngress):
-    def __init__(self, downstream_model_1, downstream_model_2):
+    def __init__(
+        self, downstream_model_1: DeploymentHandle, downstream_model_2: DeploymentHandle
+    ):
         self._d1 = downstream_model_1
         self._d2 = downstream_model_2
 
         super().__init__(lambda: gr.Interface(self.fanout, "textbox", "textbox"))
 
     async def fanout(self, text):
-        refs = await asyncio.gather(self._d1.remote(text), self._d2.remote(text))
-        [result1, result2] = ray.get(refs)
+        [result1, result2] = await asyncio.gather(
+            self._d1.remote(text), self._d2.remote(text)
+        )
         return (
             f"[Generated text version 1]\n{result1}\n\n"
             f"[Generated text version 2]\n{result2}"
@@ -58,11 +61,10 @@ app = MyGradioServer.bind(app1, app2)
 # Test example code
 serve.run(app)
 response = requests.post(
-    "http://127.0.0.1:8000/api/predict/", json={"data": ["My name is Lewis"]}
+    "http://127.0.0.1:8000/gradio_api/run/predict/", json={"data": ["My name is Lewis"]}
 )
 assert response.status_code == 200
 print(
     "gradio-integration-parallel.py: Response from example code is",
     response.json()["data"],
 )
-serve.shutdown()

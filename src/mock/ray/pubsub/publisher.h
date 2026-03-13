@@ -12,51 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-namespace ray {
-namespace pubsub {
-namespace pub_internal {
+#pragma once
 
-class MockSubscriptionIndex : public SubscriptionIndex {
- public:
-};
-
-}  // namespace pub_internal
-}  // namespace pubsub
-}  // namespace ray
-
-namespace ray {
-namespace pubsub {
-namespace pub_internal {
-
-class MockLongPollConnection : public LongPollConnection {
- public:
-};
-
-}  // namespace pub_internal
-}  // namespace pubsub
-}  // namespace ray
-
-namespace ray {
-namespace pubsub {
-namespace pub_internal {
-
-class MockSubscriberState : public SubscriberState {
- public:
-};
-
-}  // namespace pub_internal
-}  // namespace pubsub
-}  // namespace ray
+#include "gmock/gmock.h"
+#include "ray/pubsub/publisher_interface.h"
 
 namespace ray {
 namespace pubsub {
 
-class MockPublisherInterface : public PublisherInterface {
+class MockPublisher : public PublisherInterface {
  public:
-  MOCK_METHOD(bool,
+  MOCK_METHOD(void,
+              ConnectToSubscriber,
+              (const rpc::PubsubLongPollingRequest &request,
+               std::string *publisher_id,
+               google::protobuf::RepeatedPtrField<rpc::PubMessage> *pub_messages,
+               rpc::SendReplyCallback send_reply_callback),
+              (override));
+  MOCK_METHOD(StatusSet<StatusT::InvalidArgument>,
               RegisterSubscription,
               (const rpc::ChannelType channel_type,
-               const SubscriberID &subscriber_id,
+               const UniqueID &subscriber_id,
                const std::optional<std::string> &key_id),
               (override));
   MOCK_METHOD(void, Publish, (rpc::PubMessage pub_message), (override));
@@ -64,41 +40,14 @@ class MockPublisherInterface : public PublisherInterface {
               PublishFailure,
               (const rpc::ChannelType channel_type, const std::string &key_id),
               (override));
-  MOCK_METHOD(bool,
-              UnregisterSubscription,
-              (const rpc::ChannelType channel_type,
-               const SubscriberID &subscriber_id,
-               const std::optional<std::string> &key_id),
-              (override));
-};
-
-}  // namespace pubsub
-}  // namespace ray
-
-namespace ray {
-namespace pubsub {
-
-class MockPublisher : public Publisher {
- public:
-  MOCK_METHOD(bool,
-              RegisterSubscription,
-              (const rpc::ChannelType channel_type,
-               const SubscriberID &subscriber_id,
-               const std::optional<std::string> &key_id),
-              (override));
-  MOCK_METHOD(void, Publish, (rpc::PubMessage pub_message), (override));
   MOCK_METHOD(void,
-              PublishFailure,
-              (const rpc::ChannelType channel_type, const std::string &key_id),
-              (override));
-  MOCK_METHOD(bool,
               UnregisterSubscription,
               (const rpc::ChannelType channel_type,
-               const SubscriberID &subscriber_id,
+               const UniqueID &subscriber_id,
                const std::optional<std::string> &key_id),
               (override));
-
- private:
+  MOCK_METHOD(void, UnregisterSubscriber, (const UniqueID &subscriber_id), (override));
+  MOCK_METHOD(std::string, DebugString, (), (const, override));
 };
 
 }  // namespace pubsub

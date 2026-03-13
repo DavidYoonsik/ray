@@ -3,9 +3,10 @@ import logging
 import os
 import sys
 import tempfile
-from typing import Dict, Any
 import unittest
 import urllib
+from typing import Any, Dict
+from unittest import mock
 from unittest.mock import MagicMock, Mock, patch
 
 import jsonschema
@@ -13,7 +14,6 @@ import pytest
 import yaml
 from click.exceptions import ClickException
 
-import mock
 from ray._private.test_utils import load_test_config, recursive_fnmatch
 from ray.autoscaler._private._azure.config import (
     _configure_key_pair as _azure_configure_key_pair,
@@ -148,6 +148,13 @@ class AutoscalingConfigTest(unittest.TestCase):
             "cpu_4_ondemand": new_config["available_node_types"]["cpu_4_ondemand"],
             "cpu_16_spot": new_config["available_node_types"]["cpu_16_spot"],
             "gpu_8_ondemand": new_config["available_node_types"]["gpu_8_ondemand"],
+            "neuron_core_inf_1_ondemand": {
+                "node_config": {
+                    "InstanceType": "inf2.xlarge",
+                    "ImageId": "latest_dlami",
+                },
+                "max_workers": 2,
+            },
         }
         orig_new_config = copy.deepcopy(new_config)
         expected_available_node_types = orig_new_config["available_node_types"]
@@ -164,8 +171,15 @@ class AutoscalingConfigTest(unittest.TestCase):
             "GPU": 4,
             "accelerator_type:V100": 1,
         }
+        expected_available_node_types["neuron_core_inf_1_ondemand"]["resources"] = {
+            "CPU": 4,
+            "memory": 12025908428,
+            "neuron_cores": 2,
+            "accelerator_type:aws-neuron-core": 1,
+        }
         expected_available_node_types["cpu_16_spot"]["min_workers"] = 0
         expected_available_node_types["gpu_8_ondemand"]["min_workers"] = 0
+        expected_available_node_types["neuron_core_inf_1_ondemand"]["min_workers"] = 0
 
         boto3_dict = {
             "InstanceTypes": [
@@ -184,6 +198,14 @@ class AutoscalingConfigTest(unittest.TestCase):
                     "VCpuInfo": {"DefaultVCpus": 32},
                     "MemoryInfo": {"SizeInMiB": 249856},
                     "GpuInfo": {"Gpus": [{"Name": "V100", "Count": 4}]},
+                },
+                {
+                    "InstanceType": "inf2.xlarge",
+                    "VCpuInfo": {"DefaultVCpus": 4},
+                    "MemoryInfo": {"SizeInMiB": 16384},
+                    "AcceleratorInfo": {
+                        "Accelerators": [{"Name": "Inferentia", "Count": 1}]
+                    },
                 },
             ]
         }
@@ -286,6 +308,10 @@ class AutoscalingConfigTest(unittest.TestCase):
         ] = 0
         assert prepared_config == expected_prepared
 
+    @pytest.mark.skipif(
+        sys.platform.startswith("win"),
+        reason="SSL cert verification fails on Windows CI due to outdated Miniconda CA bundle. Working to update the bundle in https://github.com/ray-project/ray/pull/61545.",
+    )
     def testValidateNetworkConfigForBackwardsCompatibility(self):
         web_yaml = (
             "https://raw.githubusercontent.com/ray-project/ray/"
@@ -494,7 +520,7 @@ class AutoscalingConfigTest(unittest.TestCase):
         )
 
         # Configure subnets modifies configs in place so we need to copy
-        # the configs for comparision after passing into the method.
+        # the configs for comparison after passing into the method.
         config_subnets_configured_post = copy.deepcopy(config_subnets_configured)
         config_subnets_worker_configured_post = copy.deepcopy(
             config_subnets_worker_configured
@@ -628,9 +654,4 @@ class AutoscalingConfigTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    import sys
-
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

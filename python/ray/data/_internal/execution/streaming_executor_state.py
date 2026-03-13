@@ -3,98 +3,172 @@
 This is split out from streaming_executor.py to facilitate better unit testing.
 """
 
-import math
+import logging
+import threading
 import time
-from collections import deque
+from collections import defaultdict
 from dataclasses import dataclass
-from typing import Deque, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import ray
-from ray.data._internal.execution.autoscaling_requester import (
-    get_or_create_autoscaling_requester_actor,
-)
+from ray.data._internal.execution.backpressure_policy import BackpressurePolicy
+from ray.data._internal.execution.bundle_queue import create_bundle_queue
 from ray.data._internal.execution.interfaces import (
     ExecutionOptions,
-    ExecutionResources,
     PhysicalOperator,
     RefBundle,
 )
+from ray.data._internal.execution.interfaces.physical_operator import (
+    DataOpTask,
+    MetadataOpTask,
+    OpTask,
+    Waitable,
+    _ActorPoolInfo,
+)
 from ray.data._internal.execution.operators.base_physical_operator import (
-    AllToAllOperator,
+    InternalQueueOperatorMixin,
 )
 from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
+from ray.data._internal.execution.ranker import Ranker
+from ray.data._internal.execution.resource_manager import (
+    ResourceManager,
+)
 from ray.data._internal.execution.util import memory_string
-from ray.data._internal.progress_bar import ProgressBar
+from ray.data._internal.util import (
+    unify_schemas_with_validation,
+)
+
+if TYPE_CHECKING:
+    from ray.data.block import Schema
+
+logger = logging.getLogger(__name__)
 
 # Holds the full execution state of the streaming topology. It's a dict mapping each
 # operator to tracked streaming exec state.
 Topology = Dict[PhysicalOperator, "OpState"]
 
-# A RefBundle or an exception / end of stream indicator.
-MaybeRefBundle = Union[RefBundle, Exception, None]
 
-# The fraction of the object store capacity that will be used as the default object
-# store memory limit for the streaming executor.
-DEFAULT_OBJECT_STORE_MEMORY_LIMIT_FRACTION = 0.25
-
-# Min number of seconds between two autoscaling requests.
-MIN_GAP_BETWEEN_AUTOSCALING_REQUESTS = 20
-
-
-@dataclass
-class AutoscalingState:
-    """State of the interaction between an executor and Ray autoscaler."""
-
-    # The timestamp of the latest resource request made to Ray autoscaler
-    # by an executor.
-    last_request_ts: int = 0
-
-
-@dataclass
-class TopologyResourceUsage:
-    """Snapshot of resource usage in a `Topology` object.
-
-    The stats here can be computed on the fly from any `Topology`; this class
-    serves only a convenience wrapper to access the current usage snapshot.
+class OpBufferQueue:
+    """A FIFO queue to buffer RefBundles between upstream and downstream operators.
+    This class is thread-safe.
     """
 
-    # The current usage of the topology (summed across all operators and queues).
-    overall: ExecutionResources
+    def __init__(self):
+        self._num_blocks = 0
+        self._queue = create_bundle_queue()
+        self._num_per_split = defaultdict(int)
+        self._lock = threading.Lock()
+        # Used to buffer output RefBundles indexed by output splits.
+        self._outputs_by_split = defaultdict(create_bundle_queue)
+        super().__init__()
 
-    # The downstream resource usage by operator.
-    downstream_memory_usage: Dict[PhysicalOperator, "DownstreamMemoryInfo"]
-
-    @staticmethod
-    def of(topology: Topology) -> "TopologyResourceUsage":
-        """Calculate the resource usage of the given topology."""
-        downstream_usage = {}
-        cur_usage = ExecutionResources(0, 0, 0)
-        # Iterate from last to first operator.
-        for op, state in list(topology.items())[::-1]:
-            cur_usage = cur_usage.add(op.current_resource_usage())
-            # Don't count input refs towards dynamic memory usage, as they have been
-            # pre-created already outside this execution.
-            if not isinstance(op, InputDataBuffer):
-                cur_usage.object_store_memory += state.outqueue_memory_usage()
-            # Subtract one from denom to account for input buffer.
-            f = (1.0 + len(downstream_usage)) / max(1.0, len(topology) - 1.0)
-            downstream_usage[op] = DownstreamMemoryInfo(
-                topology_fraction=min(1.0, f),
-                object_store_memory=cur_usage.object_store_memory,
+    @property
+    def memory_usage(self) -> int:
+        """The total memory usage of the queue in bytes."""
+        with self._lock:
+            # The split queues contain bundles popped from the main queue. So, a bundle
+            # will either be in the main queue or in one of the split queues, and we
+            # don't need to worry about double counting.
+            return self._queue.estimate_size_bytes() + sum(
+                split_queue.estimate_size_bytes()
+                for split_queue in self._outputs_by_split.values()
             )
-        return TopologyResourceUsage(cur_usage, downstream_usage)
+
+    @property
+    def num_blocks(self) -> int:
+        """The total number of blocks in the queue."""
+        with self._lock:
+            return self._num_blocks
+
+    def __len__(self):
+        with self._lock:
+            return len(self._queue)
+
+    def has_next(self, output_split_idx: Optional[int] = None) -> bool:
+        """Whether next RefBundle is available.
+
+        Args:
+            output_split_idx: If specified, only check ref bundles with the
+                given output split.
+        """
+        if output_split_idx is None:
+            with self._lock:
+                return len(self._queue) > 0
+        else:
+            with self._lock:
+                return self._num_per_split[output_split_idx] > 0
+
+    def append(self, ref: RefBundle):
+        """Append a RefBundle to the queue."""
+        with self._lock:
+            self._queue.add(ref)
+            self._num_blocks += len(ref.blocks)
+            if ref.output_split_idx is not None:
+                self._num_per_split[ref.output_split_idx] += 1
+
+    def pop(self, output_split_idx: Optional[int] = None) -> Optional[RefBundle]:
+        """Pop a RefBundle from the queue.
+        Args:
+            output_split_idx: If specified, only pop a RefBundle
+                with the given output split.
+        Returns:
+            A RefBundle if available, otherwise None.
+        """
+        ret = None
+        if output_split_idx is None:
+            try:
+                with self._lock:
+                    ret = self._queue.get_next()
+            except IndexError:
+                pass
+        else:
+            with self._lock:
+                split_queue = self._outputs_by_split[output_split_idx]
+            if len(split_queue) == 0:
+                # Move all ref bundles to their indexed queues
+                # Note, the reason why we do indexing here instead of in the append
+                # is because only the last `OpBufferQueue` in the DAG, which will call
+                # pop with output_split_idx, needs indexing.
+                # If we also index the `OpBufferQueue`s in the middle, we cannot
+                # preserve the order of ref bundles with different output splits.
+                with self._lock:
+                    while len(self._queue) > 0:
+                        ref = self._queue.get_next()
+                        self._outputs_by_split[ref.output_split_idx].add(ref)
+            try:
+                ret = split_queue.get_next()
+            except IndexError:
+                pass
+        if ret is None:
+            return None
+        with self._lock:
+            self._num_blocks -= len(ret.blocks)
+            if ret.output_split_idx is not None:
+                self._num_per_split[ret.output_split_idx] -= 1
+        return ret
+
+    def clear(self):
+        with self._lock:
+            self._queue.clear()
+            self._num_blocks = 0
+            self._num_per_split.clear()
 
 
 @dataclass
-class DownstreamMemoryInfo:
-    """Mem stats of an operator and its downstream operators in a topology."""
+class OpSchedulingStatus:
+    """The scheduling status of an operator.
 
-    # The fraction of the topology this covers, e.g., the last operator of a 4-op
-    # graph would have fraction `0.25`.
-    topology_fraction: float
+    This will be updated each time when StreamingExecutor makes
+    a scheduling decision, i.e., in each `select_operator_to_run`
+    call.
+    """
 
-    # The resources used by this operator and operators downstream of this operator.
-    object_store_memory: float
+    # Whether the op was considered runnable in the last scheduling
+    # decision.
+    runnable: bool = False
+    # Whether the resources were sufficient for the operator to run
+    # in the last scheduling decision.
+    under_resource_limits: bool = False
 
 
 class OpState:
@@ -107,161 +181,193 @@ class OpState:
     operator queues to be shared across threads.
     """
 
-    def __init__(self, op: PhysicalOperator, inqueues: List[Deque[MaybeRefBundle]]):
-        # Each inqueue is connected to another operator's outqueue.
+    def __init__(self, op: PhysicalOperator, inqueues: List[OpBufferQueue]):
+        # Each input queue is connected to another operator's output queue.
         assert len(inqueues) == len(op.input_dependencies), (op, inqueues)
-        self.inqueues: List[Deque[MaybeRefBundle]] = inqueues
-        # The outqueue is connected to another operator's inqueue (they physically
-        # share the same Python list reference).
+        self.input_queues: List[OpBufferQueue] = inqueues
+        # The output queue is connected to another operator's input queue (same object).
         #
         # Note: this queue is also accessed concurrently from the consumer thread.
         # (in addition to the streaming executor thread). Hence, it must be a
         # thread-safe type such as `deque`.
-        self.outqueue: Deque[MaybeRefBundle] = deque()
+        self.output_queue: OpBufferQueue = OpBufferQueue()
         self.op = op
-        self.progress_bar = None
         self.num_completed_tasks = 0
         self.inputs_done_called = False
         # Tracks whether `input_done` is called for each input op.
         self.input_done_called = [False] * len(op.input_dependencies)
-        self.dependents_completed_called = False
+        # Used for StreamingExecutor to signal exception or end of execution
+        self._finished: bool = False
+        self._exception: Optional[Exception] = None
+        self._scheduling_status = OpSchedulingStatus()
+        self._schema: Optional["Schema"] = None
+        self._warned_on_schema_divergence: bool = False
 
-    def initialize_progress_bars(self, index: int, verbose_progress: bool) -> int:
-        """Create progress bars at the given index (line offset in console).
+    def __repr__(self):
+        return f"OpState({self.op.name})"
 
-        For AllToAllOperator, zero or more sub progress bar would be created.
-        Return the number of progress bars created for this operator.
+    def has_pending_bundles(self) -> bool:
+        return any(len(q) > 0 for q in self.input_queues)
+
+    def total_enqueued_input_blocks(self) -> int:
+        """Total number of blocks currently enqueued among:
+        1. Input queue(s) pending dispatching (``OpState.input_queues``)
+        2. Operator's internal queues (like ``MapOperator``s ref-bundler, etc)
         """
-        is_all_to_all = isinstance(self.op, AllToAllOperator)
-        # Only show 1:1 ops when in verbose progress mode.
-        enabled = verbose_progress or is_all_to_all
-        self.progress_bar = ProgressBar(
-            "- " + self.op.name,
-            self.op.num_outputs_total() or 1,
-            index,
-            enabled=enabled,
+        external_queue_size = sum(q.num_blocks for q in self.input_queues)
+        internal_queue_size = (
+            self.op.internal_input_queue_num_blocks()
+            if isinstance(self.op, InternalQueueOperatorMixin)
+            else 0
         )
-        if enabled:
-            num_bars = 1
-            if is_all_to_all:
-                num_bars += self.op.initialize_sub_progress_bars(index + 1)
-        else:
-            num_bars = 0
-        return num_bars
+        return external_queue_size + internal_queue_size
 
-    def close_progress_bars(self):
-        """Close all progress bars for this operator."""
-        if self.progress_bar:
-            self.progress_bar.close()
-            if isinstance(self.op, AllToAllOperator):
-                self.op.close_sub_progress_bars()
+    def total_enqueued_input_blocks_bytes(self) -> int:
+        """Total number of bytes occupied by input bundles currently enqueued among:
+        1. Input queue(s) pending dispatching (``OpState.input_queues``)
+        2. Operator's internal queues (like ``MapOperator``s ref-bundler, etc)
+        """
+        internal_queue_size_bytes = (
+            self.op.internal_input_queue_num_bytes()
+            if isinstance(self.op, InternalQueueOperatorMixin)
+            else 0
+        )
+        return self.input_queue_bytes() + internal_queue_size_bytes
 
-    def num_queued(self) -> int:
-        """Return the number of queued bundles across all inqueues."""
-        return sum(len(q) for q in self.inqueues)
+    def total_enqueued_output_blocks(self) -> int:
+        """Total number of blocks currently enqueued among:
 
-    def num_processing(self):
-        """Return the number of bundles currently in processing for this operator."""
-        return self.op.num_active_work_refs() + self.op.internal_queue_size()
+        1. Output queue(s) pending dispatching (``OpState.output_queue``)
+        2. Operator's internal output queues (like ``MapOperator``s reordering
+        bundle-queue, when ``preserve_order=True`` etc)
+        """
+        external_queue_size = self.output_queue.num_blocks
+        internal_queue_size = (
+            self.op.internal_output_queue_num_blocks()
+            if isinstance(self.op, InternalQueueOperatorMixin)
+            else 0
+        )
+
+        return external_queue_size + internal_queue_size
+
+    def total_enqueued_output_blocks_bytes(self) -> int:
+        """Total number of bytes occupied by output bundles currently enqueued
+        among:
+
+        1. Output queue(s) pending dispatching (``OpState.output_queue``)
+        2. Operator's internal output queues (like ``MapOperator``s reordering
+        bundle-queue, when ``preserve_order=True`` etc)
+        """
+        internal_queue_size_bytes = (
+            self.op.internal_output_queue_num_bytes()
+            if isinstance(self.op, InternalQueueOperatorMixin)
+            else 0
+        )
+
+        return self.output_queue_bytes() + internal_queue_size_bytes
 
     def add_output(self, ref: RefBundle) -> None:
         """Move a bundle produced by the operator to its outqueue."""
-        self.outqueue.append(ref)
-        self.num_completed_tasks += 1
-        if self.progress_bar:
-            self.progress_bar.update(1)
 
-    def refresh_progress_bar(self) -> None:
-        """Update the console with the latest operator progress."""
-        if self.progress_bar:
-            self.progress_bar.set_description(self.summary_str())
-
-    def summary_str(self) -> str:
-        queued = self.num_queued() + self.op.internal_queue_size()
-        active = self.op.num_active_work_refs()
-        desc = f"- {self.op.name}: {active} active, {queued} queued"
-        mem = memory_string(
-            (self.op.current_resource_usage().object_store_memory or 0)
-            + self.inqueue_memory_usage()
+        out_ref, diverged = dedupe_schemas_with_validation(
+            self._schema,
+            ref,
+            enforce_schemas=self.op.data_context.enforce_schemas,
         )
-        desc += f", {mem} objects"
-        suffix = self.op.progress_str()
-        if suffix:
-            desc += f", {suffix}"
-        return desc
+
+        if (
+            diverged
+            and not self._warned_on_schema_divergence
+            and self.op.data_context.enforce_schemas
+        ):
+            warning_message = _build_schemas_mismatch_warning(self._schema, ref.schema)
+            logger.warning(warning_message)
+
+        ref = out_ref
+
+        self._schema = ref.schema
+        self._warned_on_schema_divergence |= diverged
+
+        self.output_queue.append(ref)
+        self.num_completed_tasks += 1
+
+        actor_info = self.op.get_actor_info()
+
+        self.op.metrics.num_alive_actors = actor_info.running
+        self.op.metrics.num_restarting_actors = actor_info.restarting
+        self.op.metrics.num_pending_actors = actor_info.pending
+        for next_op in self.op.output_dependencies:
+            next_op.metrics.num_external_inqueue_blocks += len(ref.blocks)
+            next_op.metrics.num_external_inqueue_bytes += ref.size_bytes()
+        self.op.metrics.num_external_outqueue_blocks += len(ref.blocks)
+        self.op.metrics.num_external_outqueue_bytes += ref.size_bytes()
 
     def dispatch_next_task(self) -> None:
         """Move a bundle from the operator inqueue to the operator itself."""
-        for i, inqueue in enumerate(self.inqueues):
-            if inqueue:
-                self.op.add_input(inqueue.popleft(), input_index=i)
+        for i, inqueue in enumerate(self.input_queues):
+            ref = inqueue.pop()
+            if ref is not None:
+                self.op.add_input(ref, input_index=i)
+                self.op.metrics.num_external_inqueue_bytes -= ref.size_bytes()
+                self.op.metrics.num_external_inqueue_blocks -= len(ref.blocks)
+                input_op = self.op.input_dependencies[i]
+                # TODO: This needs to be cleaned up.
+                # the input_op's output queue = curr_op's input queue
+                input_op.metrics.num_external_outqueue_blocks -= len(ref.blocks)
+                input_op.metrics.num_external_outqueue_bytes -= ref.size_bytes()
                 return
+
         assert False, "Nothing to dispatch"
 
-    def get_output_blocking(self, output_split_idx: Optional[int]) -> MaybeRefBundle:
+    def get_output_blocking(self, output_split_idx: Optional[int]) -> RefBundle:
         """Get an item from this node's output queue, blocking as needed.
 
         Returns:
             The RefBundle from the output queue, or an error / end of stream indicator.
+
+        Raises:
+            StopIteration: If all outputs are already consumed.
+            Exception: If there was an exception raised during execution.
         """
         while True:
-            try:
-                # Non-split output case.
-                if output_split_idx is None:
-                    return self.outqueue.popleft()
-
-                # Scan the queue and look for outputs tagged for the given index.
-                for i in range(len(self.outqueue)):
-                    bundle = self.outqueue[i]
-                    if bundle is None or isinstance(bundle, Exception):
-                        # End of stream for this index! Note that we
-                        # do not remove the None, so that it can act
-                        # as the termination signal for all indices.
-                        return bundle
-                    elif bundle.output_split_idx == output_split_idx:
-                        self.outqueue.remove(bundle)
-                        return bundle
-
-                # Didn't find any outputs matching this index, repeat the loop until
-                # we find one or hit a None.
-            except IndexError:
-                pass
+            # Check if StreamingExecutor has caught an exception or is done execution.
+            if self._exception is not None:
+                raise self._exception
+            elif self._finished and not self.output_queue.has_next(output_split_idx):
+                raise StopIteration()
+            ref = self.output_queue.pop(output_split_idx)
+            if ref is not None:
+                # Update outqueue metrics when blocks are removed from this operator's outqueue
+                # TODO: Abstract queue-releated metrics to queue.
+                self.op.metrics.num_external_outqueue_blocks -= len(ref.blocks)
+                self.op.metrics.num_external_outqueue_bytes -= ref.size_bytes()
+                return ref
             time.sleep(0.01)
 
-    def inqueue_memory_usage(self) -> int:
+    def input_queue_bytes(self) -> int:
         """Return the object store memory of this operator's inqueue."""
         total = 0
-        for op, inq in zip(self.op.input_dependencies, self.inqueues):
+        for op, inq in zip(self.op.input_dependencies, self.input_queues):
             # Exclude existing input data items from dynamic memory usage.
             if not isinstance(op, InputDataBuffer):
-                total += self._queue_memory_usage(inq)
+                total += inq.memory_usage
         return total
 
-    def outqueue_memory_usage(self) -> int:
+    def output_queue_bytes(self) -> int:
         """Return the object store memory of this operator's outqueue."""
-        return self._queue_memory_usage(self.outqueue)
+        return self.output_queue.memory_usage
 
-    def _queue_memory_usage(self, queue: Deque[RefBundle]) -> int:
-        """Sum the object store memory usage in this queue.
-
-        Note: Python's deque isn't truly thread-safe since it raises RuntimeError
-        if it detects concurrent iteration. Hence we don't use its iterator but
-        manually index into it.
-        """
-
-        object_store_memory = 0
-        for i in range(len(queue)):
-            try:
-                bundle = queue[i]
-                object_store_memory += bundle.size_bytes()
-            except IndexError:
-                break  # Concurrent pop from the outqueue by the consumer thread.
-        return object_store_memory
+    def mark_finished(self, exception: Optional[Exception] = None):
+        """Marks this operator as finished. Used for exiting get_output_blocking."""
+        if exception is None:
+            self._finished = True
+        else:
+            self._exception = exception
 
 
 def build_streaming_topology(
     dag: PhysicalOperator, options: ExecutionOptions
-) -> Tuple[Topology, int]:
+) -> Topology:
     """Instantiate the streaming operator state topology for the given DAG.
 
     This involves creating the operator state for each operator in the DAG,
@@ -274,7 +380,6 @@ def build_streaming_topology(
 
     Returns:
         The topology dict holding the streaming execution state.
-        The number of progress bars initialized so far.
     """
 
     topology: Topology = {}
@@ -286,9 +391,9 @@ def build_streaming_topology(
 
         # Wire up the input outqueues to this op's inqueues.
         inqueues = []
-        for i, parent in enumerate(op.input_dependencies):
+        for parent in op.input_dependencies:
             parent_state = setup_state(parent)
-            inqueues.append(parent_state.outqueue)
+            inqueues.append(parent_state.output_queue)
 
         # Create state.
         op_state = OpState(op, inqueues)
@@ -297,58 +402,146 @@ def build_streaming_topology(
         return op_state
 
     setup_state(dag)
-
-    # Create the progress bars starting from the first operator to run.
-    # Note that the topology dict is in topological sort order. Index zero is reserved
-    # for global progress information.
-    i = 1
-    for op_state in list(topology.values()):
-        if not isinstance(op_state.op, InputDataBuffer):
-            i += op_state.initialize_progress_bars(i, options.verbose_progress)
-
-    return (topology, i)
+    return topology
 
 
-def process_completed_tasks(topology: Topology) -> None:
+def process_completed_tasks(
+    topology: Topology,
+    backpressure_policies: List[BackpressurePolicy],
+    max_errored_blocks: int,
+) -> int:
     """Process any newly completed tasks. To update operator
-    states, call `update_operator_states()` afterwards."""
+    states, call `update_operator_states()` afterwards.
 
-    # Update active tasks.
-    active_tasks: Dict[ray.ObjectRef, PhysicalOperator] = {}
+    Args:
+        topology: The topology of operators.
+        backpressure_policies: The backpressure policies to use.
+        max_errored_blocks: Max number of errored blocks to allow,
+            unlimited if negative.
+    Returns:
+        The number of errored blocks.
+    """
 
-    for op in topology.keys():
-        for ref in op.get_work_refs():
-            active_tasks[ref] = op
+    # All active tasks, keyed by their waitables.
+    active_tasks: Dict[Waitable, Tuple[OpState, OpTask]] = {}
+    for op, state in topology.items():
+        for task in op.get_active_tasks():
+            active_tasks[task.get_waitable()] = (state, task)
+
+    remaining_output_budget: Dict[OpState, int] = {}
+    for op, state in topology.items():
+        # Check all backpressure policies for max_task_output_bytes_to_read
+        # Use the minimum limit from all policies (most restrictive)
+        max_bytes_to_read = None
+        # Track the first policy that limits output (returning 0 bytes)
+        limiting_policy = None
+        for policy in backpressure_policies:
+            policy_limit = policy.max_task_output_bytes_to_read(op)
+            if policy_limit is not None:
+                if policy_limit == 0 and limiting_policy is None:
+                    limiting_policy = policy.name
+                if max_bytes_to_read is None:
+                    max_bytes_to_read = policy_limit
+                else:
+                    max_bytes_to_read = min(max_bytes_to_read, policy_limit)
+
+        assert (
+            max_bytes_to_read is None or max_bytes_to_read >= 0
+        ), f"Max bytes to read must either be null or >= 0 (got {max_bytes_to_read})"
+
+        # If no policy provides a limit, there's no limit
+        op.notify_in_task_output_backpressure(max_bytes_to_read == 0, limiting_policy)
+
+        if max_bytes_to_read is not None:
+            remaining_output_budget[state] = max_bytes_to_read
 
     # Process completed Ray tasks and notify operators.
+    num_errored_blocks = 0
     if active_tasks:
-        completed, _ = ray.wait(
-            list(active_tasks),
+        ready, _ = ray.wait(
+            list(active_tasks.keys()),
             num_returns=len(active_tasks),
             fetch_local=False,
             timeout=0.1,
         )
-        for ref in completed:
-            op = active_tasks.pop(ref)
-            op.notify_work_completed(ref)
+
+        # Organize tasks by the operator they belong to, and sort them by task index.
+        # So that we'll process them in a deterministic order.
+        # This is because backpressure policies may limit the number of blocks to read
+        # per operator. In this case, we want to have fewer tasks finish quickly and
+        # yield resources, instead of having all tasks output blocks together.
+        ready_tasks_by_op = defaultdict(list)
+        for ref in ready:
+            state, task = active_tasks[ref]
+            ready_tasks_by_op[state].append(task)
+
+        for state, ready_tasks in ready_tasks_by_op.items():
+            # TODO elaborate why sorting (helps preserve_order case)
+            ready_tasks = sorted(ready_tasks, key=lambda t: t.task_index())
+            for task in ready_tasks:
+                if isinstance(task, DataOpTask):
+                    try:
+                        bytes_read = task.on_data_ready(
+                            remaining_output_budget.get(state, None)
+                        )
+                        if state in remaining_output_budget:
+                            # Clamp remaining output budget at 0
+                            remaining_output_budget[state] = max(
+                                remaining_output_budget[state] - bytes_read, 0
+                            )
+                    except Exception as e:
+                        num_errored_blocks += 1
+                        should_ignore = (
+                            max_errored_blocks < 0
+                            or max_errored_blocks >= num_errored_blocks
+                        )
+                        error_message = (
+                            "An exception was raised from a task of "
+                            f'operator "{state.op.name}".'
+                        )
+                        if should_ignore:
+                            remaining = (
+                                max_errored_blocks - num_errored_blocks
+                                if max_errored_blocks >= 0
+                                else "unlimited"
+                            )
+                            error_message += (
+                                " Ignoring this exception with remaining"
+                                f" max_errored_blocks={remaining}."
+                            )
+                            logger.error(error_message, exc_info=e)
+                        else:
+                            error_message += (
+                                " Dataset execution will now abort."
+                                " To ignore this exception and continue, set"
+                                " DataContext.max_errored_blocks."
+                            )
+                            logger.exception(error_message)
+                            raise e from None
+                else:
+                    assert isinstance(task, MetadataOpTask)
+                    task.on_task_finished()
 
     # Pull any operator outputs into the streaming op state.
     for op, op_state in topology.items():
         while op.has_next():
             op_state.add_output(op.get_next())
 
+    return num_errored_blocks
+
 
 def update_operator_states(topology: Topology) -> None:
     """Update operator states accordingly for newly completed tasks.
     Should be called after `process_completed_tasks()`."""
 
-    # Call inputs_done() on ops where no more inputs are coming.
     for op, op_state in topology.items():
+
+        # Call inputs_done() on ops where no more inputs are coming.
         if op_state.inputs_done_called:
             continue
         all_inputs_done = True
         for idx, dep in enumerate(op.input_dependencies):
-            if dep.completed() and not topology[dep].outqueue:
+            if dep.has_completed() and not topology[dep].output_queue:
                 if not op_state.input_done_called[idx]:
                     op.input_done(idx)
                     op_state.input_done_called[idx] = True
@@ -360,211 +553,322 @@ def update_operator_states(topology: Topology) -> None:
             op_state.inputs_done_called = True
 
     # Traverse the topology in reverse topological order.
-    # For each op, if all of its downstream operators don't need any more inputs,
-    # call all_dependents_complete() to also complete this op.
+    # For each op, if all of its downstream operators have completed.
+    # call mark_execution_finished() to also complete this op.
     for op, op_state in reversed(list(topology.items())):
-        if op_state.dependents_completed_called:
-            continue
+
         dependents_completed = len(op.output_dependencies) > 0 and all(
-            not dep.need_more_inputs() for dep in op.output_dependencies
+            dep.has_completed() for dep in op.output_dependencies
         )
         if dependents_completed:
-            op.all_dependents_complete()
-            op_state.dependents_completed_called = True
+            op.mark_execution_finished()
+
+        # Drain external input queue if current operator is execution finished.
+        # This is needed when the limit is reached, and `mark_execution_finished`
+        # is called manually.
+        if op.has_execution_finished():
+            for input_queue in op_state.input_queues:
+                # Drain input queue
+                input_queue.clear()
+
+
+def get_eligible_operators(
+    topology: Topology,
+    backpressure_policies: List[BackpressurePolicy],
+    *,
+    ensure_liveness: bool,
+) -> List[PhysicalOperator]:
+    """This method returns all operators that are eligible for execution in the current state
+    of the pipeline.
+
+    Operator is considered eligible for execution iff:
+
+        1. It's NOT completed
+        2. It has at least 1 input block (in the input queue)
+        3. It can accept new inputs
+        4. It's not currently throttled (for task-submission)
+
+    """
+
+    dispatchable_ops: List[PhysicalOperator] = []
+    # Filter to ops that are eligible for execution, ie ones that are
+    #   - Dispatchable
+    #   - Not throttled
+    eligible_ops: List[PhysicalOperator] = []
+
+    for op, state in topology.items():
+        # Operator is considered being in task-submission back-pressure if any
+        # back-pressure policy is violated. Track the first triggered policy.
+        triggered_policy = None
+        for p in backpressure_policies:
+            if not p.can_add_input(op):
+                triggered_policy = p.name
+                break
+        in_backpressure = triggered_policy is not None
+
+        op_runnable = False
+
+        # Check whether operator could start executing immediately:
+        #   - It's not completed
+        #   - It can accept at least one input
+        #   - Its input queue has a valid bundle
+        if (
+            not op.has_completed()
+            and op.can_add_input()
+            and state.has_pending_bundles()
+        ):
+            if not in_backpressure:
+                op_runnable = True
+                eligible_ops.append(op)
+            else:
+                dispatchable_ops.append(op)
+
+        # Update scheduling status
+        state._scheduling_status = OpSchedulingStatus(
+            runnable=op_runnable,
+            under_resource_limits=not in_backpressure,
+        )
+
+        # Signal whether op in backpressure for stats collections
+        op.notify_in_task_submission_backpressure(in_backpressure, triggered_policy)
+
+    # To ensure liveness, allow at least 1 operator to schedule tasks regardless of
+    # limits in case when topology is entirely idle (no active tasks running)
+    if (
+        not eligible_ops
+        and ensure_liveness
+        and all(op.num_active_tasks() == 0 for op in topology)
+    ):
+        return dispatchable_ops
+
+    return eligible_ops
 
 
 def select_operator_to_run(
     topology: Topology,
-    cur_usage: TopologyResourceUsage,
-    limits: ExecutionResources,
-    ensure_at_least_one_running: bool,
-    execution_id: str,
-    autoscaling_state: AutoscalingState,
+    resource_manager: ResourceManager,
+    backpressure_policies: List[BackpressurePolicy],
+    ensure_liveness: bool,
+    ranker: "Ranker",
 ) -> Optional[PhysicalOperator]:
-    """Select an operator to run, if possible.
+    """Select next operator to launch new tasks.
 
-    The objective of this function is to maximize the throughput of the overall
-    pipeline, subject to defined memory and parallelism limits.
+    The objective of this method is to maximize the throughput of the overall
+    pipeline, subject to defined memory, parallelism and other constraints.
 
-    This is currently implemented by applying backpressure on operators that are
-    producing outputs faster than they are consuming them `len(outqueue)`, as well as
-    operators with a large number of running tasks `num_processing()`.
+    To achieve that this method implements following protocol:
 
-    Note that memory limits also apply to the outqueue of the output operator. This
-    provides backpressure if the consumer is slow. However, once a bundle is returned
-    to the user, it is no longer tracked.
+        1. Collects all _eligible_ to run operators (check `_get_eligible_ops`
+           for more details)
+        2. Applies stack-ranking algorithm to select the best operator (check
+           `_create_eligible_ops_ranker` for more details)
+
     """
-    assert isinstance(cur_usage, TopologyResourceUsage), cur_usage
+    eligible_ops = get_eligible_operators(
+        topology,
+        backpressure_policies,
+        ensure_liveness=ensure_liveness,
+    )
 
-    # Filter to ops that are eligible for execution.
-    ops = []
-    for op, state in topology.items():
-        under_resource_limits = _execution_allowed(op, cur_usage, limits)
-        if (
-            op.need_more_inputs()
-            and state.num_queued() > 0
-            and op.should_add_input()
-            and under_resource_limits
-            and not op.completed()
-        ):
-            ops.append(op)
-        # Update the op in all cases to enable internal autoscaling, etc.
-        op.notify_resource_usage(state.num_queued(), under_resource_limits)
-
-    # If no ops are allowed to execute due to resource constraints, try to trigger
-    # cluster scale-up.
-    if not ops and any(state.num_queued() > 0 for state in topology.values()):
-        now = time.time()
-        if (
-            now
-            > autoscaling_state.last_request_ts + MIN_GAP_BETWEEN_AUTOSCALING_REQUESTS
-        ):
-            autoscaling_state.last_request_ts = now
-            _try_to_scale_up_cluster(topology, execution_id)
-
-    # To ensure liveness, allow at least 1 op to run regardless of limits. This is
-    # gated on `ensure_at_least_one_running`, which is set if the consumer is blocked.
-    if (
-        ensure_at_least_one_running
-        and not ops
-        and all(op.num_active_work_refs() == 0 for op in topology)
-    ):
-        # The topology is entirely idle, so choose from all ready ops ignoring limits.
-        ops = [
-            op
-            for op, state in topology.items()
-            if op.need_more_inputs() and state.num_queued() > 0 and not op.completed()
-        ]
-
-    # Nothing to run.
-    if not ops:
+    if not eligible_ops:
         return None
 
-    # Run metadata-only operators first. After that, equally penalize outqueue length
-    # and num bundles processing for backpressure.
-    return min(
-        ops,
-        key=lambda op: (
-            not op.throttling_disabled(),
-            len(topology[op].outqueue) + topology[op].num_processing(),
-        ),
-    )
+    ranks = ranker.rank_operators(eligible_ops, topology, resource_manager)
+
+    assert len(eligible_ops) == len(ranks), (eligible_ops, ranks)
+
+    next_op, _ = min(zip(eligible_ops, ranks), key=lambda t: t[1])
+
+    return next_op
 
 
-def _try_to_scale_up_cluster(topology: Topology, execution_id: str):
-    """Try to scale up the cluster to accomodate the provided in-progress workload.
+def _actor_info_summary_str(info: _ActorPoolInfo) -> str:
+    total = info.running + info.pending + info.restarting
+    base = f"Actors: {total}"
 
-    This makes a resource request to Ray's autoscaler consisting of the current,
-    aggregate usage of all operators in the DAG + the incremental usage of all operators
-    that are ready for dispatch (i.e. that have inputs queued). If the autoscaler were
-    to grant this resource request, it would allow us to dispatch one task for every
-    ready operator.
-
-    Note that this resource request does not take the global resource limits or the
-    liveness policy into account; it only tries to make the existing resource usage +
-    one more task per ready operator feasible in the cluster.
-
-    Args:
-        topology: The execution state of the in-progress workload for which we wish to
-            request more resources.
-    """
-    # Get resource usage for all ops + additional resources needed to launch one more
-    # task for each ready op.
-    resource_request = []
-
-    def to_bundle(resource: ExecutionResources) -> Dict:
-        req = {}
-        if resource.cpu:
-            req["CPU"] = math.ceil(resource.cpu)
-        if resource.gpu:
-            req["GPU"] = math.ceil(resource.gpu)
-        return req
-
-    for op, state in topology.items():
-        per_task_resource = op.incremental_resource_usage()
-        task_bundle = to_bundle(per_task_resource)
-        resource_request.extend([task_bundle] * op.num_active_work_refs())
-        # Only include incremental resource usage for ops that are ready for
-        # dispatch.
-        if state.num_queued() > 0:
-            # TODO(Clark): Scale up more aggressively by adding incremental resource
-            # usage for more than one bundle in the queue for this op?
-            resource_request.append(task_bundle)
-
-    # Make autoscaler resource request.
-    actor = get_or_create_autoscaling_requester_actor()
-    actor.request_resources.remote(resource_request, execution_id)
+    if total == info.running:
+        return base
+    else:
+        return f"{base} ({info})"
 
 
-def _execution_allowed(
-    op: PhysicalOperator,
-    global_usage: TopologyResourceUsage,
-    global_limits: ExecutionResources,
-) -> bool:
-    """Return whether an operator is allowed to execute given resource usage.
-
-    Operators are throttled globally based on CPU and GPU limits for the stream.
-
-    For an N operator DAG, we only throttle the kth operator (in the source-to-sink
-    ordering) on object store utilization if the cumulative object store utilization
-    for the kth operator and every operator downstream from it is greater than
-    k/N * global_limit; i.e., the N - k operator sub-DAG is using more object store
-    memory than it's share.
+def _format_schema_mismatch_section(
+    title: str, entries: List[str], truncate_num_mismatched_fields_to: int
+) -> str:
+    """Generate a titled section of the schema mismatch warning.
 
     Args:
-        op: The operator to check.
-        global_usage: Resource usage across the entire topology.
-        global_limits: Execution resource limits.
+        title: Section title describing the mismatched fields.
+        entries: Field detail strings (name + type).
+        truncate_num_mismatched_fields_to: Max entries shown before truncation.
 
     Returns:
-        Whether the op is allowed to run.
+        A formatted message for the warning section, or "" if entries is empty.
+    """
+    if not entries:
+        return ""
+
+    shown = entries[:truncate_num_mismatched_fields_to]
+    remainder = len(entries) - truncate_num_mismatched_fields_to
+
+    body = "\n".join(f"    {line}" for line in shown)
+    suffix = f"\n    ... and {remainder} more" if remainder > 0 else ""
+
+    return f"{title} ({len(entries)} total):\n{body}{suffix}\n"
+
+
+def _build_schemas_mismatch_warning(
+    old_schema: "Schema", new_schema: Optional["Schema"], truncation_length: int = 20
+) -> str:
+    from ray.data.block import _is_empty_schema
+
+    if _is_empty_schema(new_schema):
+        old_fields_info = [
+            f"{name}: {str(t)}" for name, t in zip(old_schema.names, old_schema.types)
+        ]
+        is_empty_message = _format_schema_mismatch_section(
+            "Operator produced a RefBundle with an empty/unknown schema.",
+            old_fields_info,
+            truncate_num_mismatched_fields_to=truncation_length,
+        )
+        return is_empty_message + "This may lead to unexpected behavior."
+
+    # We assume old_schema and new_schema have the same underlying type
+    # and can only either be PyArrow schemas or PandasBlockSchema
+    old_fields = {name: str(t) for name, t in zip(old_schema.names, old_schema.types)}
+    new_fields = {name: str(t) for name, t in zip(new_schema.names, new_schema.types)}
+
+    new_exclusive_fields = [name for name in new_fields if name not in old_fields]
+    old_exclusive_fields = [name for name in old_fields if name not in new_fields]
+    changed_fields = [
+        name
+        for name in new_fields
+        if name in old_fields and new_fields[name] != old_fields[name]
+    ]
+
+    new_excl_fields_info = [
+        f"{field}: {new_fields[field]}" for field in new_exclusive_fields
+    ]
+    old_excl_fields_info = [
+        f"{field}: {old_fields[field]}" for field in old_exclusive_fields
+    ]
+    changed_fields_info = [
+        f"{field}: {old_fields[field]} => {new_fields[field]}"
+        for field in changed_fields
+    ]
+
+    new_excl_fields_message = _format_schema_mismatch_section(
+        "Fields exclusive to the incoming schema",
+        new_excl_fields_info,
+        truncate_num_mismatched_fields_to=truncation_length,
+    )
+    old_excl_fields_message = _format_schema_mismatch_section(
+        "Fields exclusive to the old schema",
+        old_excl_fields_info,
+        truncate_num_mismatched_fields_to=truncation_length,
+    )
+    changed_fields_message = _format_schema_mismatch_section(
+        "Fields that have different types across the old and the incoming schemas",
+        changed_fields_info,
+        truncate_num_mismatched_fields_to=truncation_length,
+    )
+
+    disordered_message = ""
+    if not new_exclusive_fields and not old_exclusive_fields and not changed_fields:
+        assert old_fields == new_fields
+        disordered_message = "Some fields are ordered differently across the old and the incoming schemas.\n"
+
+    return (
+        "Operator produced a RefBundle with a different schema "
+        "than the previous one.\n"
+        + new_excl_fields_message
+        + old_excl_fields_message
+        + changed_fields_message
+        + disordered_message
+        + "This may lead to unexpected behavior."
+    )
+
+
+def dedupe_schemas_with_validation(
+    old_schema: Optional["Schema"],
+    bundle: "RefBundle",
+    enforce_schemas: bool = False,
+) -> Tuple["RefBundle", bool]:
+    """Unify/Dedupe two schemas
+
+    Args:
+        old_schema: The old schema to unify. This can be `None`, in which case
+            the new schema will be used as the old schema.
+        bundle: The new `RefBundle` to unify with the old schema.
+        enforce_schemas: If `True`, allow the schemas to diverge and return unified schema.
+            If `False`, but keep the old schema.
+
+    Returns:
+        A ref bundle with the unified schema of the two input schemas.
     """
 
-    if op.throttling_disabled():
-        return True
+    # Note, often times the refbundles correspond to only one schema. We can reduce the
+    # memory footprint of multiple schemas by keeping only one copy.
+    diverged = False
 
-    assert isinstance(global_usage, TopologyResourceUsage), global_usage
-    # To avoid starvation problems when dealing with fractional resource types,
-    # convert all quantities to integer (0 or 1) for deciding admissibility. This
-    # allows operators with non-integral requests to slightly overshoot the limit.
-    global_floored = ExecutionResources(
-        cpu=math.floor(global_usage.overall.cpu or 0),
-        gpu=math.floor(global_usage.overall.gpu or 0),
-        object_store_memory=global_usage.overall.object_store_memory,
+    from ray.data.block import _is_empty_schema
+
+    if _is_empty_schema(old_schema):
+        return bundle, diverged
+
+    # This check is fast assuming pyarrow schemas
+    if old_schema == bundle.schema:
+        return bundle, diverged
+
+    diverged = True
+    if enforce_schemas:
+        old_schema = unify_schemas_with_validation([old_schema, bundle.schema])
+
+    return (
+        RefBundle(
+            bundle.blocks,
+            schema=old_schema,
+            owns_blocks=bundle.owns_blocks,
+            output_split_idx=bundle.output_split_idx,
+            _cached_object_meta=bundle._cached_object_meta,
+            _cached_preferred_locations=bundle._cached_preferred_locations,
+        ),
+        diverged,
     )
-    inc = op.incremental_resource_usage()
-    if inc.cpu and inc.gpu:
-        raise NotImplementedError(
-            "Operator incremental resource usage cannot specify both CPU "
-            "and GPU at the same time, since it may cause deadlock."
-        )
-    elif inc.object_store_memory:
-        raise NotImplementedError(
-            "Operator incremental resource usage must not include memory."
-        )
-    inc_indicator = ExecutionResources(
-        cpu=1 if inc.cpu else 0,
-        gpu=1 if inc.gpu else 0,
-        object_store_memory=1 if inc.object_store_memory else 0,
-    )
 
-    # Under global limits; always allow.
-    new_usage = global_floored.add(inc_indicator)
-    if new_usage.satisfies_limit(global_limits):
-        return True
 
-    # We're over global limits, but execution may still be allowed if memory is the
-    # only bottleneck and this wouldn't impact downstream memory limits. This avoids
-    # stalling the execution for memory bottlenecks that occur upstream.
-    # See for more context: https://github.com/ray-project/ray/pull/32673
-    global_limits_sans_memory = ExecutionResources(
-        cpu=global_limits.cpu, gpu=global_limits.gpu
-    )
-    global_ok_sans_memory = new_usage.satisfies_limit(global_limits_sans_memory)
-    downstream_usage = global_usage.downstream_memory_usage[op]
-    downstream_limit = global_limits.scale(downstream_usage.topology_fraction)
-    downstream_memory_ok = ExecutionResources(
-        object_store_memory=downstream_usage.object_store_memory
-    ).satisfies_limit(downstream_limit)
+def format_op_state_summary(
+    op_state: OpState, resource_manager: ResourceManager, verbose: bool = False
+) -> str:
+    """Get a formatted summary of the OpState for progress reporting."""
+    # Active tasks
+    active = op_state.op.num_active_tasks()
+    desc = f"Tasks: {active}"
+    if (
+        op_state.op._in_task_submission_backpressure
+        or op_state.op._in_task_output_backpressure
+    ):
+        backpressure_types = []
+        if op_state.op._in_task_submission_backpressure:
+            # The op is backpressured from submitting new tasks.
+            policy = op_state.op._task_submission_backpressure_policy or ""
+            backpressure_types.append(f"tasks({policy})")
+        if op_state.op._in_task_output_backpressure:
+            # The op is backpressured from producing new outputs.
+            policy = op_state.op._task_output_backpressure_policy or ""
+            backpressure_types.append(f"outputs({policy})")
+        desc += f" [backpressured:{','.join(backpressure_types)}]"
 
-    return global_ok_sans_memory and downstream_memory_ok
+    # Actors info
+    desc += f"; {_actor_info_summary_str(op_state.op.get_actor_info())}"
+
+    # Queued blocks
+    desc += f"; Queued blocks: {op_state.total_enqueued_input_blocks()} ({memory_string(op_state.total_enqueued_input_blocks_bytes())})"
+    desc += f"; Resources: {resource_manager.get_op_usage_str(op_state.op, verbose=verbose)}"
+
+    # Any additional operator specific information.
+    suffix = op_state.op.progress_str()
+    if suffix:
+        desc += f"; {suffix}"
+
+    return desc

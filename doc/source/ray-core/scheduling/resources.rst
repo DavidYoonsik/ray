@@ -21,7 +21,10 @@ Physical resources are resources that a machine physically has such as physical 
 and logical resources are virtual resources defined by a system.
 
 Ray resources are **logical** and don’t need to have 1-to-1 mapping with physical resources.
-For example, you can start a Ray head node with 3 GPUs via ``ray start --head --num-gpus=3`` even if it physically has zero.
+For example, you can start a Ray head node with 0 logical CPUs via ``ray start --head --num-cpus=0``
+even if it physically has eight
+(This signals the Ray scheduler to not schedule any tasks or actors that require logical CPU resources
+on the head node, mainly to reserve the head node for running Ray system processes.).
 They are mainly used for admission control during scheduling.
 
 The fact that resources are logical has several implications:
@@ -36,6 +39,20 @@ The fact that resources are logical has several implications:
 - Ray does provide :ref:`GPU <gpu-support>` isolation in the form of *visible devices* by automatically setting the ``CUDA_VISIBLE_DEVICES`` environment variable,
   which most ML frameworks will respect for purposes of GPU assignment.
 
+.. _omp-num-thread-note:
+
+.. note::
+    Ray sets the environment variable ``OMP_NUM_THREADS=<num_cpus>`` if ``num_cpus`` is set on
+    the task/actor via :func:`ray.remote() <ray.remote>` and :meth:`task.options() <ray.remote_function.RemoteFunction.options>`/:meth:`actor.options() <ray.actor.ActorClass.options>`.
+    Ray sets ``OMP_NUM_THREADS=1`` if ``num_cpus`` is not specified; this
+    is done to avoid performance degradation with many workers (issue #6998). You can
+    also override this by explicitly setting ``OMP_NUM_THREADS`` to override anything Ray sets by default.
+    ``OMP_NUM_THREADS`` is commonly used in numpy, PyTorch, and Tensorflow to perform multi-threaded
+    linear algebra. In multi-worker setting, we want one thread per worker instead of many threads
+    per worker to avoid contention. Some other libraries may have their own way to configure
+    parallelism. For example, if you're using OpenCV, you should manually set the number of
+    threads using cv2.setNumThreads(num_threads) (set to 0 to disable multi-threading).
+
 .. figure:: ../images/physical_resources_vs_logical_resources.svg
 
   Physical resources vs logical resources
@@ -45,33 +62,26 @@ The fact that resources are logical has several implications:
 Custom Resources
 ----------------
 
-Besides pre-defined resources, you can also specify a Ray node's custom resources and request them in your tasks or actors.
-Some use cases for custom resources:
+You can specify custom resources for a Ray node and reference them to control scheduling for your tasks or actors.
 
-- Your node has special hardware and you can represent it as a custom resource.
-  Then your tasks or actors can request the custom resource via ``@ray.remote(resources={"special_hardware": 1})``
-  and Ray will schedule the tasks or actors to the node that has the custom resource.
-- You can use custom resources as labels to tag nodes and you can achieve label based affinity scheduling.
-  For example, you can do ``ray.remote(resources={"custom_label": 0.001})`` to schedule tasks or actors to nodes with ``custom_label`` custom resource.
-  For this use case, the actual quantity doesn't matter, and the convention is to specify a tiny number so that the label resource is
-  not the limiting factor for parallelism.
+Use custom resources when you need to manage scheduling using numeric values. If you need simple label-based scheduling, use labels instead. See :doc:`labels`.
 
 .. _specify-node-resources:
 
 Specifying Node Resources
 -------------------------
 
-By default, Ray nodes start with pre-defined CPU, GPU, and memory resources. The quantities of these resources on each node are set to the physical quantities auto detected by Ray.
+By default, Ray nodes start with pre-defined CPU, GPU, and memory resources. The quantities of these logical resources on each node are set to the physical quantities auto detected by Ray.
 By default, logical resources are configured by the following rule.
 
 .. warning::
 
     Ray **does not permit dynamic updates of resource capacities after Ray has been started on a node**.
 
-- **Number of logical CPUs (``num_cpus``)**: Set to the number of CPUs of the machine/container.
-- **Number of logical GPUs (``num_gpus``)**: Set to the number of GPUs of the machine/container.
-- **Memory (``memory``)**: Set to 70% of "available memory" when ray runtime starts.
-- **Object Store Memory (``object_store_memory``)**: Set to 30% of "available memory" when ray runtime starts. Note that the object store memory is not logical resource, and users cannot use it for scheduling.
+- **Number of logical CPUs** (``num_cpus``): Set to the number of CPUs of the machine/container.
+- **Number of logical GPUs** (``num_gpus``): Set to the number of GPUs of the machine/container.
+- **Memory** (``memory``): Set to 70% of "available memory" when ray runtime starts.
+- **Object Store Memory** (``object_store_memory``): Set to 30% of "available memory" when ray runtime starts. Note that the object store memory is not logical resource, and users cannot use it for scheduling.
 
 However, you can always override that by manually specifying the quantities of pre-defined resources and adding custom resources.
 There are several ways to do that depending on how you start the Ray cluster:
@@ -128,17 +138,17 @@ There are several ways to do that depending on how you start the Ray cluster:
 Specifying Task or Actor Resource Requirements
 ----------------------------------------------
 
-Ray allows specifying a task or actor's resource requirements (e.g., CPU, GPU, and custom resources).
-The task or actor will only run on a node if there are enough required resources
+Ray allows specifying a task or actor's logical resource requirements (e.g., CPU, GPU, and custom resources).
+The task or actor will only run on a node if there are enough required logical resources
 available to execute the task or actor.
 
-By default, Ray tasks use 1 CPU resource and Ray actors use 1 CPU for scheduling and 0 CPU for running
+By default, Ray tasks use 1 logical CPU resource and Ray actors use 1 logical CPU for scheduling, and 0 logical CPU for running.
 (This means, by default, actors cannot get scheduled on a zero-cpu node, but an infinite number of them can run on any non-zero cpu node.
 The default resource requirements for actors was chosen for historical reasons.
 It's recommended to always explicitly set ``num_cpus`` for actors to avoid any surprises.
-If resources are specified explicitly, they are required for both scheduling and running.)
+If resources are specified explicitly, they are required both at schedule time and at execution time.)
 
-You can also explicitly specify a task's or actor's resource requirements (for example, one task may require a GPU) instead of using default ones via :func:`ray.remote() <ray.remote>`
+You can also explicitly specify a task's or actor's logical resource requirements (for example, one task may require a GPU) instead of using default ones via :func:`ray.remote() <ray.remote>`
 and :meth:`task.options() <ray.remote_function.RemoteFunction.options>`/:meth:`actor.options() <ray.actor.ActorClass.options>`.
 
 .. tab-set::
@@ -169,8 +179,8 @@ and :meth:`task.options() <ray.remote_function.RemoteFunction.options>`/:meth:`a
             ray::Actor(CreateCounter).SetResource("CPU", 2.0).SetResource("GPU", 1.0).Remote();
 
 Task and actor resource requirements have implications for the Ray's scheduling concurrency.
-In particular, the sum of the resource requirements of all of the
-concurrently executing tasks and actors on a given node cannot exceed the node's total resources.
+In particular, the sum of the logical resource requirements of all of the
+concurrently executing tasks and actors on a given node cannot exceed the node's total logical resources.
 This property can be used to :ref:`limit the number of concurrently running tasks or actors to avoid issues like OOM <core-patterns-limit-running-tasks>`.
 
 .. _fractional-resource-requirements:
@@ -187,7 +197,11 @@ The precision of the fractional resource requirement is 0.0001 so you should avo
     :start-after: __specifying_fractional_resource_requirements_start__
     :end-before: __specifying_fractional_resource_requirements_end__
 
+.. note::
+
+  GPU, TPU, and neuron_cores resource requirements that are greater than 1, need to be whole numbers. For example, ``num_gpus=1.5`` is invalid.
+
 .. tip::
 
   Besides resource requirements, you can also specify an environment for a task or actor to run in,
-  which can include Python packages, local files, environment variables, and more---see :ref:`Runtime Environments <runtime-environments>` for details.
+  which can include Python packages, local files, environment variables, and more. See :ref:`Runtime Environments <runtime-environments>` for details.

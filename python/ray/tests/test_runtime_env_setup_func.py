@@ -1,25 +1,48 @@
-import threading
-import os
-import sys
 import logging
+import os
+import platform
+import sys
+import tempfile
+import threading
+from unittest.mock import MagicMock
 
 import pytest
 
 import ray
+import ray._private.ray_constants as ray_constants
+from ray._common.test_utils import wait_for_condition
+from ray._private.function_manager import build_setup_hook_export_entry
+from ray._private.runtime_env.setup_hook import (
+    decode_function_key,
+    upload_worker_process_setup_hook_if_needed,
+)
+from ray._private.test_utils import format_web_url
+from ray.job_submission import JobStatus, JobSubmissionClient
 
 
-def test_setup_func_basic(shutdown_only):
+def _hook():
+    logger = logging.getLogger("")
+    logger.setLevel(logging.DEBUG)
+
+
+@pytest.mark.parametrize("is_module", [False, True])
+def test_setup_func_basic(shutdown_only, is_module):
     def configure_logging(level: int):
         logger = logging.getLogger("")
         logger.setLevel(level)
 
-    ray.init(
-        num_cpus=1,
-        runtime_env={
+    if is_module:
+        runtime_env = {
+            "worker_process_setup_hook": "ray.tests.test_runtime_env_setup_func._hook",  # noqa
+            "env_vars": {"ABC": "123"},
+        }
+    else:
+        runtime_env = {
             "worker_process_setup_hook": lambda: configure_logging(logging.DEBUG),
             "env_vars": {"ABC": "123"},
-        },
-    )
+        }
+
+    ray.init(num_cpus=1, runtime_env=runtime_env)
 
     @ray.remote
     def f(level):
@@ -147,8 +170,179 @@ def test_setup_func_failure(shutdown_only):
     assert "Failed to execute the setup hook method." in str(e.value)
 
 
+def test_setup_hook_module_failure(shutdown_only):
+    # Use a module that cannot be found.
+    ray.init(
+        runtime_env={
+            "worker_process_setup_hook": (
+                "ray.tests.test_runtime_env_setup_func._hooks"
+            )
+        },
+    )
+
+    @ray.remote
+    class A:
+        pass
+
+    a = A.remote()
+    with pytest.raises(ray.exceptions.RayActorError) as e:
+        ray.get(a.__ray_ready__.remote())
+    assert "Failed to execute the setup hook method" in str(e.value)
+
+
+@pytest.mark.skipif(platform.system() == "Windows", reason="Doesn't support Windows.")
+def test_job_submission_not_allowed_for_callable(shutdown_only):
+    temp_dir = None
+    file_path = None
+
+    try:
+        # Create a temporary directory
+        temp_dir = tempfile.mkdtemp()
+
+        # Define pytest tests as a string
+        pytest_content = """
+import ray
+import sys
+
+@ray.remote
+def f():
+    import logging
+    logger = logging.getLogger("")
+    logger.debug("this is debug")
+    assert logger.getEffectiveLevel() == logging.DEBUG
+
+ray.get(f.remote())
+        """
+
+        # Create a temporary Python file with pytest content
+        file_path = os.path.join(temp_dir, "test_temp.py")
+
+        with open(file_path, "w") as file:
+            file.write(pytest_content)
+
+        # Get the absolute path
+        absolute_path = os.path.abspath(file_path)
+        # Create a cluster.
+        ray.init()
+        address = ray._private.worker._global_node.webui_url
+        address = format_web_url(address)
+        client = JobSubmissionClient(address)
+
+        with pytest.raises(
+            ValueError,
+            match="Invalid type <class 'function'> for `worker_process_setup_hook`.",
+        ):
+            job = client.submit_job(
+                entrypoint=f"python {absolute_path}",
+                runtime_env={"worker_process_setup_hook": lambda: print("abc")},
+            )
+
+        job = client.submit_job(
+            entrypoint=f"python {absolute_path}",
+            runtime_env={
+                "worker_process_setup_hook": (
+                    "ray.tests.test_runtime_env_setup_func._hook"
+                )
+            },
+        )
+
+        def verify():
+            status = client.get_job_status(job)
+            if status == JobStatus.FAILED:
+                print("job status is ", status)
+                print("job logs are", client.get_job_logs(job))
+
+            return client.get_job_status(job) == JobStatus.SUCCEEDED
+
+        wait_for_condition(verify)
+
+    finally:
+        if file_path:
+            os.remove(file_path)
+        if temp_dir:
+            os.rmdir(temp_dir)
+
+
+def test_upload_hook_reprocessing_module_match():
+    runtime_env = {
+        "worker_process_setup_hook": "my.module.hook",
+        "env_vars": {
+            ray_constants.WORKER_PROCESS_SETUP_HOOK_ENV_VAR: "my.module.hook",
+        },
+    }
+    result = upload_worker_process_setup_hook_if_needed(runtime_env, worker=None)
+    assert (
+        result["env_vars"][ray_constants.WORKER_PROCESS_SETUP_HOOK_ENV_VAR]
+        == "my.module.hook"
+    )
+
+
+def test_upload_hook_type_mismatch():
+    """A callable setup_func vs a module-path env var is a type mismatch."""
+    runtime_env = {
+        "worker_process_setup_hook": lambda: None,
+        "env_vars": {
+            ray_constants.WORKER_PROCESS_SETUP_HOOK_ENV_VAR: "my.module.hook",
+        },
+    }
+    with pytest.raises(RuntimeError, match="Conflicting worker_process_setup_hook"):
+        upload_worker_process_setup_hook_if_needed(runtime_env, worker=None)
+
+
+def test_upload_hook_str_callable_ref_mismatch():
+    """A module-path setup_func vs a callable-ref env var is a type mismatch."""
+
+    def existing_hook():
+        return None
+
+    _, _, key = build_setup_hook_export_entry(existing_hook, b"\x01" * 4)
+    callable_ref = decode_function_key(key)
+    runtime_env = {
+        "worker_process_setup_hook": "totally.different.module",
+        "env_vars": {
+            ray_constants.WORKER_PROCESS_SETUP_HOOK_ENV_VAR: callable_ref,
+        },
+    }
+    with pytest.raises(RuntimeError, match="Conflicting worker_process_setup_hook"):
+        upload_worker_process_setup_hook_if_needed(runtime_env, worker=None)
+
+
+def test_upload_hook_module_mismatch():
+    """Conflicting module-path strings must be detected and rejected."""
+    runtime_env = {
+        "worker_process_setup_hook": "my.module.hook_a",
+        "env_vars": {
+            ray_constants.WORKER_PROCESS_SETUP_HOOK_ENV_VAR: "my.module.hook_b",
+        },
+    }
+    with pytest.raises(RuntimeError, match="Conflicting worker_process_setup_hook"):
+        upload_worker_process_setup_hook_if_needed(runtime_env, worker=None)
+
+
+def test_upload_hook_callable_mismatch():
+    """Two different callables referencing different GCS keys must be rejected."""
+    mock_worker = MagicMock()
+    mock_worker.current_job_id.binary.return_value = b"\x00" * 4
+
+    def setup_a():
+        return None
+
+    def setup_b():
+        return "different"
+
+    _, _, key = build_setup_hook_export_entry(
+        setup_a, mock_worker.current_job_id.binary.return_value
+    )
+    existing_callable_ref = decode_function_key(key)
+    runtime_env = {
+        "worker_process_setup_hook": setup_b,
+        "env_vars": {
+            ray_constants.WORKER_PROCESS_SETUP_HOOK_ENV_VAR: existing_callable_ref,
+        },
+    }
+    with pytest.raises(RuntimeError, match="Conflicting worker_process_setup_hook"):
+        upload_worker_process_setup_hook_if_needed(runtime_env, worker=mock_worker)
+
+
 if __name__ == "__main__":
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

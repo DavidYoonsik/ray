@@ -1,30 +1,16 @@
-import sys
-from typing import Optional, Set
-
 import os
 from dataclasses import dataclass
-
-import ray
-from ray.air.checkpoint import Checkpoint
-from ray.train.backend import BackendConfig, Backend, _warn_about_bad_checkpoint_type
-from ray.train._internal.utils import update_env_vars
-from ray.train._internal.worker_group import WorkerGroup, Worker
+from typing import Optional, Set
 
 from horovod.ray.runner import Coordinator
 from horovod.ray.utils import detect_nics, nics_to_env_var
 from horovod.runner.common.util import secret, timeout
 
+import ray
+from ray.train._internal.utils import update_env_vars
+from ray.train._internal.worker_group import Worker, WorkerGroup
+from ray.train.backend import Backend, BackendConfig
 from ray.util import PublicAPI
-
-try:
-    from ray.train.torch.torch_checkpoint import TorchCheckpoint
-except ImportError:
-    TorchCheckpoint = None
-
-try:
-    from ray.train.tensorflow.tensorflow_checkpoint import TensorflowCheckpoint
-except ImportError:
-    TensorflowCheckpoint = None
 
 
 @PublicAPI(stability="beta")
@@ -86,6 +72,10 @@ class _HorovodBackend(Backend):
     share_cuda_visible_devices: bool = True
 
     def on_start(self, worker_group: WorkerGroup, backend_config: HorovodConfig):
+        # NOTE: Horovod backend uses V1 WorkerGroup directly instead of BaseWorkerGroup
+        # because it requires direct access to worker metadata (node_id, hostname) that is
+        # specific to the V1 implementation. Horovod does not support V2 WorkerGroup.
+
         # TODO(matt): Implement placement group strategies in BackendExecutor.
 
         # Initialize workers with Horovod environment variables
@@ -143,27 +133,6 @@ class _HorovodBackend(Backend):
         coordinator_envs.update(nics_to_env_var(nics))
 
         worker_group.execute(update_env_vars, coordinator_envs)
-
-    @classmethod
-    def _encode_data(cls, checkpoint: Checkpoint):
-        checkpoint = super()._encode_data(checkpoint)
-        if type(checkpoint) is Checkpoint:
-            if checkpoint.get_internal_representation()[0] == "data_dict":
-                if "tensorflow" in sys.modules:
-                    from ray.air._internal.tensorflow_utils import (
-                        contains_tensorflow_object,
-                    )
-
-                    if contains_tensorflow_object(checkpoint.to_dict()):
-                        _warn_about_bad_checkpoint_type(TensorflowCheckpoint)
-                        checkpoint = TensorflowCheckpoint.from_checkpoint(checkpoint)
-                if "torch" in sys.modules:
-                    from ray.air._internal.torch_utils import contains_tensor
-
-                    if contains_tensor(checkpoint.to_dict()):
-                        _warn_about_bad_checkpoint_type(TorchCheckpoint)
-                        checkpoint = TorchCheckpoint.from_checkpoint(checkpoint)
-        return checkpoint
 
 
 def _init_env_vars(world_rank: int, world_size: int, node_id: str):

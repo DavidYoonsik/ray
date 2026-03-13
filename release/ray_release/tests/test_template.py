@@ -1,66 +1,55 @@
-import pytest
 import sys
 
-from ray_release.test import Test
+import pytest
+
 from ray_release.exception import ReleaseTestConfigError
-from ray_release.template import populate_cluster_env_variables, render_yaml_template
-
-TEST_APP_CONFIG_CPU = """
-base_image: {{ env["RAY_IMAGE_NIGHTLY_CPU"] | default("anyscale/ray:nightly-py37") }}
-env_vars: {}
-debian_packages:
-  - curl
-"""
-
-TEST_APP_CONFIG_GPU = """
-base_image: {{ env["RAY_IMAGE_ML_NIGHTLY_GPU"] | default("anyscale/ray-ml:nightly-py37-gpu") }}
-env_vars: {}
-debian_packages:
-  - curl
-"""  # noqa: E501
+from ray_release.template import bazel_runfile, get_working_dir
+from ray_release.test import Test
 
 
-def test_python_version_default_cpu():
-    test = Test()
-
-    env = populate_cluster_env_variables(test, ray_wheels_url="")
-    result = render_yaml_template(TEST_APP_CONFIG_CPU, env=env)
-
-    assert result["base_image"] == "anyscale/ray:nightly-py37"
-
-
-def test_python_version_39_cpu():
-    test = Test(python="3.9")
-
-    env = populate_cluster_env_variables(test, ray_wheels_url="")
-    result = render_yaml_template(TEST_APP_CONFIG_CPU, env=env)
-
-    assert result["base_image"] == "anyscale/ray:nightly-py39"
+def test_get_working_dir_with_path_from_root():
+    test_with_path_from_root = Test(
+        {
+            "name": "test",
+            "working_dir": "//ray_testing/ray_release/tests",
+        }
+    )
+    assert (
+        get_working_dir(test_with_path_from_root, None, "/tmp/bazel_workspace")
+        == "/tmp/bazel_workspace/ray_testing/ray_release/tests"
+    )
+    assert get_working_dir(test_with_path_from_root, None, None) == bazel_runfile(
+        "ray_testing/ray_release/tests"
+    )
 
 
-def test_python_version_default_gpu():
-    test = Test()
-
-    env = populate_cluster_env_variables(test, ray_wheels_url="")
-    result = render_yaml_template(TEST_APP_CONFIG_GPU, env=env)
-
-    assert result["base_image"] == "anyscale/ray-ml:nightly-py37-gpu"
-
-
-def test_python_version_39_gpu():
-    test = Test(python="3.9")
-
-    env = populate_cluster_env_variables(test, ray_wheels_url="")
-    result = render_yaml_template(TEST_APP_CONFIG_GPU, env=env)
-
-    assert result["base_image"] == "anyscale/ray-ml:nightly-py39-gpu"
+def test_get_working_dir_with_relative_path():
+    test_with_relative_path = Test(
+        {
+            "name": "test",
+            "working_dir": "ray_release/tests",
+        }
+    )
+    assert (
+        get_working_dir(test_with_relative_path, None, "/tmp/bazel_workspace")
+        == "/tmp/bazel_workspace/release/ray_release/tests"
+    )
+    assert get_working_dir(test_with_relative_path, None, None) == bazel_runfile(
+        "release/ray_release/tests"
+    )
 
 
-def test_python_version_invalid():
-    test = Test(python="3.x")
-
+def test_get_working_dir_fail():
+    test_with_path_from_root = Test(
+        {
+            "name": "test",
+            "working_dir": "//ray_testing/ray_release/tests",
+        }
+    )
     with pytest.raises(ReleaseTestConfigError):
-        populate_cluster_env_variables(test, ray_wheels_url="")
+        get_working_dir(
+            test_with_path_from_root, "/tmp/test_definition_root", "tmp/bazel_workspace"
+        )
 
 
 if __name__ == "__main__":

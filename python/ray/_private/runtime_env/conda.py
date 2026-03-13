@@ -2,7 +2,6 @@ import hashlib
 import json
 import logging
 import os
-import platform
 import runpy
 import shutil
 import subprocess
@@ -14,21 +13,26 @@ import yaml
 from filelock import FileLock
 
 import ray
+from ray._common.utils import (
+    get_or_create_event_loop,
+    try_to_create_directory,
+)
 from ray._private.runtime_env.conda_utils import (
     create_conda_env_if_needed,
     delete_conda_env,
     get_conda_activate_commands,
+    get_conda_envs,
+    get_conda_info_json,
 )
 from ray._private.runtime_env.context import RuntimeEnvContext
 from ray._private.runtime_env.packaging import Protocol, parse_uri
 from ray._private.runtime_env.plugin import RuntimeEnvPlugin
+from ray._private.runtime_env.validation import parse_and_validate_conda
 from ray._private.utils import (
     get_directory_size_bytes,
     get_master_wheel_url,
-    get_or_create_event_loop,
     get_release_wheel_url,
     get_wheel_filename,
-    try_to_create_directory,
 )
 
 default_logger = logging.getLogger(__name__)
@@ -106,10 +110,6 @@ def _current_py_version():
     return ".".join(map(str, sys.version_info[:3]))  # like 3.6.10
 
 
-def _is_m1_mac():
-    return sys.platform == "darwin" and platform.machine() == "arm64"
-
-
 def current_ray_pip_specifier(
     logger: Optional[logging.Logger] = default_logger,
 ) -> Optional[str]:
@@ -143,17 +143,9 @@ def current_ray_pip_specifier(
         return None
     elif "dev" in ray.__version__:
         # Running on a nightly wheel.
-        if _is_m1_mac():
-            raise ValueError("Nightly wheels are not available for M1 Macs.")
         return get_master_wheel_url()
     else:
-        if _is_m1_mac():
-            # M1 Mac release wheels are currently not uploaded to AWS S3; they
-            # are only available on PyPI.  So unfortunately, this codepath is
-            # not end-to-end testable prior to the release going live on PyPI.
-            return f"ray=={ray.__version__}"
-        else:
-            return get_release_wheel_url()
+        return get_release_wheel_url()
 
 
 def inject_dependencies(
@@ -222,7 +214,7 @@ def get_uri(runtime_env: Dict) -> Optional[str]:
             # we don't track them with URIs.
             uri = None
         elif isinstance(conda, dict):
-            uri = "conda://" + _get_conda_env_hash(conda_dict=conda)
+            uri = f"conda://{_get_conda_env_hash(conda_dict=conda)}"
         else:
             raise TypeError(
                 "conda field received by RuntimeEnvAgent must be "
@@ -269,6 +261,12 @@ class CondaPlugin(RuntimeEnvPlugin):
         self._installs_and_deletions_file_lock = os.path.join(
             self._resources_dir, "ray-conda-installs-and-deletions.lock"
         )
+        # A set of named conda environments (instead of yaml or dict)
+        # that are validated to exist.
+        # NOTE: It has to be only used within the same thread, which
+        # is an event loop.
+        # Also, we don't need to GC this field because it is pretty small.
+        self._validated_named_conda_env = set()
 
     def _get_path_from_hash(self, hash: str) -> str:
         """Generate a path from the hash of a conda or pip spec.
@@ -319,18 +317,36 @@ class CondaPlugin(RuntimeEnvPlugin):
         context: RuntimeEnvContext,
         logger: logging.Logger = default_logger,
     ) -> int:
-        if uri is None:
-            # The "conda" field is the name of an existing conda env, so no
-            # need to create one.
-            # TODO(architkulkarni): Try "conda activate" here to see if the
-            # env exists, and raise an exception if it doesn't.
+        if not runtime_env.has_conda():
             return 0
 
-        # Currently create method is still a sync process, to avoid blocking
-        # the loop, need to run this function in another thread.
-        # TODO(Catch-Bull): Refactor method create into an async process, and
-        # make this method running in current loop.
         def _create():
+            result = parse_and_validate_conda(runtime_env.get("conda"))
+
+            if isinstance(result, str):
+                # The conda env name is given.
+                # In this case, we only verify if the given
+                # conda env exists.
+
+                # If the env is already validated, do nothing.
+                if result in self._validated_named_conda_env:
+                    return 0
+
+                conda_info = get_conda_info_json()
+                envs = get_conda_envs(conda_info)
+
+                # We accept `result` as a conda name or full path.
+                if not any(result == env[0] or result == env[1] for env in envs):
+                    raise ValueError(
+                        f"The given conda environment '{result}' "
+                        f"from the runtime env {runtime_env} doesn't "
+                        "exist from the output of `conda info --json`. "
+                        "You can only specify an env that already exists. "
+                        f"Please make sure to create an env {result} "
+                    )
+                self._validated_named_conda_env.add(result)
+                return 0
+
             logger.debug(
                 "Setting up conda for runtime_env: " f"{runtime_env.serialize()}"
             )

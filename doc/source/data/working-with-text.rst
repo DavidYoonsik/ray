@@ -15,7 +15,7 @@ This guide shows you how to:
 Reading text files
 ------------------
 
-Ray Data can read lines of text and JSONL. Alternatiely, you can read raw binary
+Ray Data can read lines of text and JSONL. Alternatively, you can read raw binary
 files and manually decode data.
 
 .. tab-set::
@@ -23,7 +23,7 @@ files and manually decode data.
     .. tab-item:: Text lines
 
         To read lines of text, call :func:`~ray.data.read_text`. Ray Data creates a
-        row for each line of text.
+        row for each line of text. In the schema, the column name defaults to "text". 
 
         .. testcode::
 
@@ -167,9 +167,11 @@ that sets up and invokes a model. Then, call
     {'text': 'Beautiful is better than ugly.', 'label': 'POSITIVE'}
     {'text': 'Explicit is better than implicit.', 'label': 'POSITIVE'}
 
+For more information on handling large language models, see :ref:`Working with LLMs <working-with-llms>`.
+
 For more information on performing inference, see
 :ref:`End-to-end: Offline Batch Inference <batch_inference_home>`
-and :ref:`Transforming batches with actors <transforming_data_actors>`.
+and :ref:`Stateful Transforms <stateful_transforms>`.
 
 .. _saving-text:
 
@@ -180,7 +182,7 @@ To save text, call a method like :meth:`~ray.data.Dataset.write_parquet`. Ray Da
 save text in many formats.
 
 To view the full list of supported file formats, see the
-:ref:`Input/Output reference <input-output>`.
+:ref:`Saving Data API <saving-data-api>`.
 
 .. testcode::
 

@@ -1,13 +1,18 @@
+import os
 import sys
 import warnings
 
 import pytest
 
 import ray
-from ray._private.utils import get_ray_doc_version
-import ray.cluster_utils
 from ray._private.test_utils import placement_group_assert_no_leak
-from ray.util.client.ray_client_helpers import connect_to_client_or_not
+from ray._private.utils import get_ray_doc_version
+from ray.util.placement_group import (
+    VALID_PLACEMENT_GROUP_STRATEGIES,
+    _validate_bundle_label_selector,
+    _validate_bundles,
+    validate_placement_group,
+)
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 
@@ -20,8 +25,7 @@ def are_pairwise_unique(g):
     return True
 
 
-@pytest.mark.parametrize("connect_to_client", [True, False])
-def test_placement_ready(ray_start_regular, connect_to_client):
+def test_placement_ready(ray_start_regular):
     @ray.remote
     class Actor:
         def __init__(self):
@@ -30,25 +34,35 @@ def test_placement_ready(ray_start_regular, connect_to_client):
         def v(self):
             return 10
 
-    # bundle is placement group reserved resources and can't be used in bundles
+    # kBundle_ResourceLabel is placement group reserved resources and
+    # can't be used in bundles
     with pytest.raises(Exception):
         ray.util.placement_group(bundles=[{"bundle": 1}])
     # This test is to test the case that even there all resource in the
     # bundle got allocated, we are still able to return from ready[I
     # since ready use 0 CPU
-    with connect_to_client_or_not(connect_to_client):
-        pg = ray.util.placement_group(bundles=[{"CPU": 1}])
-        ray.get(pg.ready())
+    pg = ray.util.placement_group(bundles=[{"CPU": 1}])
+    ray.get(pg.ready())
+    a = Actor.options(
+        num_cpus=1,
+        scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg),
+    ).remote()
+    ray.get(a.v.remote())
+    ray.get(pg.ready())
+
+    with pytest.raises(ValueError):
         a = Actor.options(
-            num_cpus=1,
+            resources={"bundle": 1},
             scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg),
         ).remote()
         ray.get(a.v.remote())
-        ray.get(pg.ready())
 
-        placement_group_assert_no_leak([pg])
+    placement_group_assert_no_leak([pg])
 
 
+@pytest.mark.skipif(
+    ray._private.client_mode_hook.is_client_mode_enabled, reason="Fails w/ Ray Client."
+)
 def test_placement_group_invalid_resource_request(shutdown_only):
     """
     Make sure exceptions are raised if
@@ -153,11 +167,16 @@ def test_placement_group_invalid_resource_request(shutdown_only):
     placement_group_assert_no_leak([pg])
 
 
-@pytest.mark.parametrize("connect_to_client", [False, True])
-@pytest.mark.parametrize("gcs_actor_scheduling_enabled", [False, True])
-def test_placement_group_pack(
-    ray_start_cluster, connect_to_client, gcs_actor_scheduling_enabled
-):
+@pytest.mark.parametrize(
+    "ray_start_cluster",
+    [
+        {
+            "include_dashboard": True,
+        }
+    ],
+    indirect=True,
+)
+def test_placement_group_pack(ray_start_cluster):
     @ray.remote(num_cpus=2)
     class Actor(object):
         def __init__(self):
@@ -169,57 +188,54 @@ def test_placement_group_pack(
     cluster = ray_start_cluster
     num_nodes = 2
     for i in range(num_nodes):
-        cluster.add_node(
-            num_cpus=4,
-            _system_config={
-                "gcs_actor_scheduling_enabled": gcs_actor_scheduling_enabled
-            }
-            if i == 0
-            else {},
-        )
+        cluster.add_node(num_cpus=4)
     ray.init(address=cluster.address)
 
-    with connect_to_client_or_not(connect_to_client):
-        placement_group = ray.util.placement_group(
-            name="name",
-            strategy="PACK",
-            bundles=[
-                {"CPU": 2, "GPU": 0},  # Test 0 resource spec doesn't break tests.
-                {"CPU": 2},
-            ],
+    placement_group = ray.util.placement_group(
+        name="name",
+        strategy="PACK",
+        bundles=[
+            {"CPU": 2, "GPU": 0},  # Test 0 resource spec doesn't break tests.
+            {"CPU": 2},
+        ],
+    )
+    ray.get(placement_group.ready())
+    actor_1 = Actor.options(
+        scheduling_strategy=PlacementGroupSchedulingStrategy(
+            placement_group=placement_group, placement_group_bundle_index=0
         )
-        ray.get(placement_group.ready())
-        actor_1 = Actor.options(
-            scheduling_strategy=PlacementGroupSchedulingStrategy(
-                placement_group=placement_group, placement_group_bundle_index=0
-            )
-        ).remote()
-        actor_2 = Actor.options(
-            scheduling_strategy=PlacementGroupSchedulingStrategy(
-                placement_group=placement_group, placement_group_bundle_index=1
-            )
-        ).remote()
+    ).remote()
+    actor_2 = Actor.options(
+        scheduling_strategy=PlacementGroupSchedulingStrategy(
+            placement_group=placement_group, placement_group_bundle_index=1
+        )
+    ).remote()
 
-        ray.get(actor_1.value.remote())
-        ray.get(actor_2.value.remote())
+    ray.get(actor_1.value.remote())
+    ray.get(actor_2.value.remote())
 
-        # Get all actors.
-        actor_infos = ray._private.state.actors()
+    # Make sure all actors in counter_list are collocated in one node.
+    actor_info_1 = ray.util.state.get_actor(id=actor_1._actor_id.hex())
+    actor_info_2 = ray.util.state.get_actor(id=actor_2._actor_id.hex())
 
-        # Make sure all actors in counter_list are collocated in one node.
-        actor_info_1 = actor_infos.get(actor_1._actor_id.hex())
-        actor_info_2 = actor_infos.get(actor_2._actor_id.hex())
+    assert actor_info_1 and actor_info_2
 
-        assert actor_info_1 and actor_info_2
-
-        node_of_actor_1 = actor_info_1["Address"]["NodeID"]
-        node_of_actor_2 = actor_info_2["Address"]["NodeID"]
-        assert node_of_actor_1 == node_of_actor_2
-        placement_group_assert_no_leak([placement_group])
+    node_of_actor_1 = actor_info_1.node_id
+    node_of_actor_2 = actor_info_2.node_id
+    assert node_of_actor_1 == node_of_actor_2
+    placement_group_assert_no_leak([placement_group])
 
 
-@pytest.mark.parametrize("connect_to_client", [False, True])
-def test_placement_group_strict_pack(ray_start_cluster, connect_to_client):
+@pytest.mark.parametrize(
+    "ray_start_cluster",
+    [
+        {
+            "include_dashboard": True,
+        }
+    ],
+    indirect=True,
+)
+def test_placement_group_strict_pack(ray_start_cluster):
     @ray.remote(num_cpus=2)
     class Actor(object):
         def __init__(self):
@@ -234,56 +250,57 @@ def test_placement_group_strict_pack(ray_start_cluster, connect_to_client):
         cluster.add_node(num_cpus=4)
     ray.init(address=cluster.address)
 
-    with connect_to_client_or_not(connect_to_client):
-        placement_group = ray.util.placement_group(
-            name="name",
-            strategy="STRICT_PACK",
-            bundles=[
-                {
-                    "memory": 50
-                    * 1024
-                    * 1024,  # Test memory resource spec doesn't break tests.
-                    "CPU": 2,
-                },
-                {"CPU": 2},
-            ],
+    placement_group = ray.util.placement_group(
+        name="name",
+        strategy="STRICT_PACK",
+        bundles=[
+            {
+                "memory": 50
+                * 1024
+                * 1024,  # Test memory resource spec doesn't break tests.
+                "CPU": 2,
+            },
+            {"CPU": 2},
+        ],
+    )
+    ray.get(placement_group.ready())
+    actor_1 = Actor.options(
+        scheduling_strategy=PlacementGroupSchedulingStrategy(
+            placement_group=placement_group, placement_group_bundle_index=0
         )
-        ray.get(placement_group.ready())
-        actor_1 = Actor.options(
-            scheduling_strategy=PlacementGroupSchedulingStrategy(
-                placement_group=placement_group, placement_group_bundle_index=0
-            )
-        ).remote()
-        actor_2 = Actor.options(
-            scheduling_strategy=PlacementGroupSchedulingStrategy(
-                placement_group=placement_group, placement_group_bundle_index=1
-            )
-        ).remote()
+    ).remote()
+    actor_2 = Actor.options(
+        scheduling_strategy=PlacementGroupSchedulingStrategy(
+            placement_group=placement_group, placement_group_bundle_index=1
+        )
+    ).remote()
 
-        ray.get(actor_1.value.remote())
-        ray.get(actor_2.value.remote())
+    ray.get(actor_1.value.remote())
+    ray.get(actor_2.value.remote())
 
-        # Get all actors.
-        actor_infos = ray._private.state.actors()
+    # Make sure all actors in counter_list are collocated in one node.
+    actor_info_1 = ray.util.state.get_actor(id=actor_1._actor_id.hex())
+    actor_info_2 = ray.util.state.get_actor(id=actor_2._actor_id.hex())
 
-        # Make sure all actors in counter_list are collocated in one node.
-        actor_info_1 = actor_infos.get(actor_1._actor_id.hex())
-        actor_info_2 = actor_infos.get(actor_2._actor_id.hex())
+    assert actor_info_1 and actor_info_2
 
-        assert actor_info_1 and actor_info_2
+    node_of_actor_1 = actor_info_1.node_id
+    node_of_actor_2 = actor_info_2.node_id
+    assert node_of_actor_1 == node_of_actor_2
 
-        node_of_actor_1 = actor_info_1["Address"]["NodeID"]
-        node_of_actor_2 = actor_info_2["Address"]["NodeID"]
-        assert node_of_actor_1 == node_of_actor_2
-
-        placement_group_assert_no_leak([placement_group])
+    placement_group_assert_no_leak([placement_group])
 
 
-@pytest.mark.parametrize("connect_to_client", [False, True])
-@pytest.mark.parametrize("gcs_actor_scheduling_enabled", [False, True])
-def test_placement_group_spread(
-    ray_start_cluster, connect_to_client, gcs_actor_scheduling_enabled
-):
+@pytest.mark.parametrize(
+    "ray_start_cluster",
+    [
+        {
+            "include_dashboard": True,
+        }
+    ],
+    indirect=True,
+)
+def test_placement_group_spread(ray_start_cluster):
     @ray.remote
     class Actor(object):
         def __init__(self):
@@ -295,52 +312,46 @@ def test_placement_group_spread(
     cluster = ray_start_cluster
     num_nodes = 2
     for i in range(num_nodes):
-        cluster.add_node(
-            num_cpus=4,
-            _system_config={
-                "gcs_actor_scheduling_enabled": gcs_actor_scheduling_enabled
-            }
-            if i == 0
-            else {},
-        )
+        cluster.add_node(num_cpus=4)
     ray.init(address=cluster.address)
 
-    with connect_to_client_or_not(connect_to_client):
-        placement_group = ray.util.placement_group(
-            name="name",
-            strategy="STRICT_SPREAD",
-            bundles=[{"CPU": 2}, {"CPU": 2}],
-        )
-        ray.get(placement_group.ready())
-        actors = [
-            Actor.options(
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=placement_group, placement_group_bundle_index=i
-                ),
-                num_cpus=2,
-            ).remote()
-            for i in range(num_nodes)
-        ]
+    placement_group = ray.util.placement_group(
+        name="name",
+        strategy="STRICT_SPREAD",
+        bundles=[{"CPU": 2}, {"CPU": 2}],
+    )
+    ray.get(placement_group.ready())
+    actors = [
+        Actor.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=placement_group, placement_group_bundle_index=i
+            ),
+            num_cpus=2,
+        ).remote()
+        for i in range(num_nodes)
+    ]
 
-        [ray.get(actor.value.remote()) for actor in actors]
+    [ray.get(actor.value.remote()) for actor in actors]
 
-        # Get all actors.
-        actor_infos = ray._private.state.actors()
+    # Make sure all actors in counter_list are located in separate nodes.
+    actor_info_objs = [
+        ray.util.state.get_actor(id=actor._actor_id.hex()) for actor in actors
+    ]
+    assert are_pairwise_unique([info_obj.node_id for info_obj in actor_info_objs])
 
-        # Make sure all actors in counter_list are located in separate nodes.
-        actor_info_objs = [actor_infos.get(actor._actor_id.hex()) for actor in actors]
-        assert are_pairwise_unique(
-            [info_obj["Address"]["NodeID"] for info_obj in actor_info_objs]
-        )
-
-        placement_group_assert_no_leak([placement_group])
+    placement_group_assert_no_leak([placement_group])
 
 
-@pytest.mark.parametrize("connect_to_client", [False, True])
-@pytest.mark.parametrize("gcs_actor_scheduling_enabled", [False, True])
-def test_placement_group_strict_spread(
-    ray_start_cluster, connect_to_client, gcs_actor_scheduling_enabled
-):
+@pytest.mark.parametrize(
+    "ray_start_cluster",
+    [
+        {
+            "include_dashboard": True,
+        }
+    ],
+    indirect=True,
+)
+def test_placement_group_strict_spread(ray_start_cluster):
     @ray.remote
     class Actor(object):
         def __init__(self):
@@ -352,69 +363,57 @@ def test_placement_group_strict_spread(
     cluster = ray_start_cluster
     num_nodes = 3
     for i in range(num_nodes):
-        cluster.add_node(
-            num_cpus=4,
-            _system_config={
-                "gcs_actor_scheduling_enabled": gcs_actor_scheduling_enabled
-            }
-            if i == 0
-            else {},
-        )
+        cluster.add_node(num_cpus=4)
     ray.init(address=cluster.address)
 
-    with connect_to_client_or_not(connect_to_client):
-        placement_group = ray.util.placement_group(
-            name="name",
-            strategy="STRICT_SPREAD",
-            bundles=[{"CPU": 2}, {"CPU": 2}, {"CPU": 2}],
-        )
-        ray.get(placement_group.ready())
-        actors = [
-            Actor.options(
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=placement_group, placement_group_bundle_index=i
-                ),
-                num_cpus=1,
-            ).remote()
-            for i in range(num_nodes)
-        ]
+    placement_group = ray.util.placement_group(
+        name="name",
+        strategy="STRICT_SPREAD",
+        bundles=[{"CPU": 2}, {"CPU": 2}, {"CPU": 2}],
+    )
+    ray.get(placement_group.ready())
+    actors = [
+        Actor.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=placement_group, placement_group_bundle_index=i
+            ),
+            num_cpus=1,
+        ).remote()
+        for i in range(num_nodes)
+    ]
 
-        [ray.get(actor.value.remote()) for actor in actors]
+    [ray.get(actor.value.remote()) for actor in actors]
 
-        # Get all actors.
-        actor_infos = ray._private.state.actors()
+    # Make sure all actors in counter_list are located in separate nodes.
+    actor_info_objs = [
+        ray.util.state.get_actor(id=actor._actor_id.hex()) for actor in actors
+    ]
+    assert are_pairwise_unique([info_obj.node_id for info_obj in actor_info_objs])
 
-        # Make sure all actors in counter_list are located in separate nodes.
-        actor_info_objs = [actor_infos.get(actor._actor_id.hex()) for actor in actors]
-        assert are_pairwise_unique(
-            [info_obj["Address"]["NodeID"] for info_obj in actor_info_objs]
-        )
-
-        actors_no_special_bundle = [
-            Actor.options(
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=placement_group
-                ),
-                num_cpus=1,
-            ).remote()
-            for _ in range(num_nodes)
-        ]
-        [ray.get(actor.value.remote()) for actor in actors_no_special_bundle]
-
-        actor_no_resource = Actor.options(
+    actors_no_special_bundle = [
+        Actor.options(
             scheduling_strategy=PlacementGroupSchedulingStrategy(
                 placement_group=placement_group
             ),
-            num_cpus=2,
+            num_cpus=1,
         ).remote()
-        with pytest.raises(ray.exceptions.GetTimeoutError):
-            ray.get(actor_no_resource.value.remote(), timeout=1)
+        for _ in range(num_nodes)
+    ]
+    [ray.get(actor.value.remote()) for actor in actors_no_special_bundle]
 
-        placement_group_assert_no_leak([placement_group])
+    actor_no_resource = Actor.options(
+        scheduling_strategy=PlacementGroupSchedulingStrategy(
+            placement_group=placement_group
+        ),
+        num_cpus=2,
+    ).remote()
+    with pytest.raises(ray.exceptions.GetTimeoutError):
+        ray.get(actor_no_resource.value.remote(), timeout=0.5)
+
+    placement_group_assert_no_leak([placement_group])
 
 
-@pytest.mark.parametrize("connect_to_client", [False, True])
-def test_placement_group_actor_resource_ids(ray_start_cluster, connect_to_client):
+def test_placement_group_actor_resource_ids(ray_start_cluster):
     @ray.remote(num_cpus=1)
     class F:
         def f(self):
@@ -426,19 +425,16 @@ def test_placement_group_actor_resource_ids(ray_start_cluster, connect_to_client
         cluster.add_node(num_cpus=4)
     ray.init(address=cluster.address)
 
-    with connect_to_client_or_not(connect_to_client):
-        g1 = ray.util.placement_group([{"CPU": 2}])
-        a1 = F.options(
-            scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=g1)
-        ).remote()
-        resources = ray.get(a1.f.remote())
-        assert len(resources) == 1, resources
-        assert "CPU_group_" in list(resources.keys())[0], resources
-        placement_group_assert_no_leak([g1])
+    g1 = ray.util.placement_group([{"CPU": 2}])
+    a1 = F.options(
+        scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=g1)
+    ).remote()
+    resources = ray.get(a1.f.remote())
+    assert resources == {"CPU": 1}
+    placement_group_assert_no_leak([g1])
 
 
-@pytest.mark.parametrize("connect_to_client", [False, True])
-def test_placement_group_task_resource_ids(ray_start_cluster, connect_to_client):
+def test_placement_group_task_resource_ids(ray_start_cluster):
     @ray.remote(num_cpus=1)
     def f():
         return ray.get_runtime_context().get_assigned_resources()
@@ -449,34 +445,26 @@ def test_placement_group_task_resource_ids(ray_start_cluster, connect_to_client)
         cluster.add_node(num_cpus=4)
     ray.init(address=cluster.address)
 
-    with connect_to_client_or_not(connect_to_client):
-        g1 = ray.util.placement_group([{"CPU": 2}])
-        o1 = f.options(
-            scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=g1)
-        ).remote()
-        resources = ray.get(o1)
-        assert len(resources) == 1, resources
-        assert "CPU_group_" in list(resources.keys())[0], resources
-        assert "CPU_group_0_" not in list(resources.keys())[0], resources
+    g1 = ray.util.placement_group([{"CPU": 2}])
+    o1 = f.options(
+        scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=g1)
+    ).remote()
+    resources = ray.get(o1)
+    assert resources == {"CPU": 1}
 
-        # Now retry with a bundle index constraint.
-        o1 = f.options(
-            scheduling_strategy=PlacementGroupSchedulingStrategy(
-                placement_group=g1, placement_group_bundle_index=0
-            )
-        ).remote()
-        resources = ray.get(o1)
-        assert len(resources) == 2, resources
-        keys = list(resources.keys())
-        assert "CPU_group_" in keys[0], resources
-        assert "CPU_group_" in keys[1], resources
-        assert "CPU_group_0_" in keys[0] or "CPU_group_0_" in keys[1], resources
+    # Now retry with a bundle index constraint.
+    o1 = f.options(
+        scheduling_strategy=PlacementGroupSchedulingStrategy(
+            placement_group=g1, placement_group_bundle_index=0
+        )
+    ).remote()
+    resources = ray.get(o1)
+    assert resources == {"CPU": 1}
 
-        placement_group_assert_no_leak([g1])
+    placement_group_assert_no_leak([g1])
 
 
-@pytest.mark.parametrize("connect_to_client", [False, True])
-def test_placement_group_hang(ray_start_cluster, connect_to_client):
+def test_placement_group_hang(ray_start_cluster):
     @ray.remote(num_cpus=1)
     def f():
         return ray.get_runtime_context().get_assigned_resources()
@@ -487,29 +475,25 @@ def test_placement_group_hang(ray_start_cluster, connect_to_client):
         cluster.add_node(num_cpus=4)
     ray.init(address=cluster.address)
 
-    with connect_to_client_or_not(connect_to_client):
-        # Warm workers up, so that this triggers the hang rice.
-        ray.get(f.remote())
+    # Warm workers up, so that this triggers the hang rice.
+    ray.get(f.remote())
 
-        g1 = ray.util.placement_group([{"CPU": 2}])
-        # This will start out infeasible. The placement group will then be
-        # created and it transitions to feasible.
-        o1 = f.options(
-            scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=g1)
-        ).remote()
+    g1 = ray.util.placement_group([{"CPU": 2}])
+    # This will start out infeasible. The placement group will then be
+    # created and it transitions to feasible.
+    o1 = f.options(
+        scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=g1)
+    ).remote()
 
-        resources = ray.get(o1)
-        assert len(resources) == 1, resources
-        assert "CPU_group_" in list(resources.keys())[0], resources
+    resources = ray.get(o1)
+    assert resources == {"CPU": 1}
 
-        placement_group_assert_no_leak([g1])
+    placement_group_assert_no_leak([g1])
 
 
-@pytest.mark.parametrize("connect_to_client", [True, False])
-def test_placement_group_empty_bundle_error(ray_start_regular, connect_to_client):
-    with connect_to_client_or_not(connect_to_client):
-        with pytest.raises(ValueError):
-            ray.util.placement_group([])
+def test_placement_group_empty_bundle_error(ray_start_regular):
+    with pytest.raises(ValueError):
+        ray.util.placement_group([])
 
 
 def test_placement_group_equal_hash(ray_start_regular):
@@ -538,7 +522,7 @@ def test_placement_group_equal_hash(ray_start_regular):
 
 
 @pytest.mark.filterwarnings("default:placement_group parameter is deprecated")
-def test_placement_group_scheduling_warning(ray_start_regular_shared):
+def test_placement_group_scheduling_warning(ray_start_regular):
     @ray.remote
     class Foo:
         def foo():
@@ -583,13 +567,16 @@ def test_placement_group_scheduling_warning(ray_start_regular_shared):
     assert not w
 
 
+@pytest.mark.skipif(
+    ray._private.client_mode_hook.is_client_mode_enabled, reason="Fails w/ Ray Client."
+)
 @pytest.mark.filterwarnings(
     "default:Setting 'object_store_memory' for actors is deprecated"
 )
 @pytest.mark.filterwarnings(
     "default:Setting 'object_store_memory' for bundles is deprecated"
 )
-def test_object_store_memory_deprecation_warning(ray_start_regular_shared):
+def test_object_store_memory_deprecation_warning(ray_start_regular):
     with warnings.catch_warnings(record=True) as w:
 
         @ray.remote(object_store_memory=1)
@@ -611,10 +598,141 @@ def test_object_store_memory_deprecation_warning(ray_start_regular_shared):
     )
 
 
-if __name__ == "__main__":
-    import os
+def test_get_assigned_resources_in_pg(ray_start_cluster):
+    cluster = ray_start_cluster
+    cluster.add_node(num_cpus=3)
+    ray.init(address=cluster.address)
 
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    @ray.remote
+    def get_assigned_resources():
+        return ray.get_runtime_context().get_assigned_resources()
+
+    resources = ray.get(get_assigned_resources.options(num_cpus=1).remote())
+    assert resources == {"CPU": 1}
+
+    pg = ray.util.placement_group(bundles=[{"CPU": 3, "memory": 500}])
+    ray.get(pg.ready())
+
+    resources = ray.get(
+        get_assigned_resources.options(
+            num_cpus=1,
+            scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg),
+        ).remote()
+    )
+    assert resources == {"CPU": 1}
+
+    resources = ray.get(
+        get_assigned_resources.options(
+            num_cpus=1,
+            memory=100,
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=pg, placement_group_bundle_index=0
+            ),
+        ).remote()
+    )
+    assert resources == {"CPU": 1, "memory": 100}
+
+
+def test_omp_num_threads_in_pg(ray_start_cluster):
+    cluster = ray_start_cluster
+    cluster.add_node(num_cpus=3)
+    ray.init(address=cluster.address)
+
+    @ray.remote(num_cpus=3)
+    def test_omp_num_threads():
+        omp_threads = os.environ["OMP_NUM_THREADS"]
+        return int(omp_threads)
+
+    assert ray.get(test_omp_num_threads.remote()) == 3
+
+    pg = ray.util.placement_group(bundles=[{"CPU": 3}])
+    ray.get(pg.ready())
+
+    ref = test_omp_num_threads.options(
+        scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg)
+    ).remote()
+    assert ray.get(ref) == 3
+
+    ref = test_omp_num_threads.options(
+        scheduling_strategy=PlacementGroupSchedulingStrategy(
+            placement_group=pg, placement_group_bundle_index=0
+        )
+    ).remote()
+    assert ray.get(ref) == 3
+
+
+class TestPlacementGroupValidation:
+    def test_strategy_validation(self):
+        """Test strategy validation when creating a placement group."""
+
+        # Valid strategies should not raise an exception.
+        for strategy in VALID_PLACEMENT_GROUP_STRATEGIES:
+            validate_placement_group(bundles=[{"CPU": 1}], strategy=strategy)
+
+        # Any other strategy should raise a ValueError.
+        with pytest.raises(ValueError, match="Invalid placement group strategy"):
+            validate_placement_group(bundles=[{"CPU": 1}], strategy="invalid")
+
+    def test_bundle_validation(self):
+        """Test _validate_bundle()."""
+
+        # Valid bundles should not raise an exception.
+        valid_bundles = [{"CPU": 1, "custom-resource": 2.2}, {"GPU": 0.75}]
+        _validate_bundles(valid_bundles)
+
+        # Non-list bundles should raise an exception.
+        with pytest.raises(ValueError, match="must be a list"):
+            _validate_bundles("not a list")
+
+        # Empty list bundles should raise an exception.
+        with pytest.raises(ValueError, match="must be a non-empty list"):
+            _validate_bundles([])
+
+        # List that doesn't contain dictionaries should raise an exception.
+        with pytest.raises(ValueError, match="resource dictionaries"):
+            _validate_bundles([{"CPU": 1}, "not a dict"])
+
+        # List with invalid dictionary entries should raise an exception.
+        with pytest.raises(ValueError, match="resource dictionaries"):
+            _validate_bundles([{8: 7}, {5: 3.5}])
+        with pytest.raises(ValueError, match="resource dictionaries"):
+            _validate_bundles([{"CPU": "6"}, {"GPU": "5"}])
+
+        # Bundles with resources that all have 0 values should raise an exception.
+        with pytest.raises(ValueError, match="only 0 values"):
+            _validate_bundles([{"CPU": 0, "GPU": 0}])
+
+    def test_bundle_label_selector_validation(self):
+        """Test _validate_bundle_label_selector()."""
+
+        # Valid label selector list should not raise an exception.
+        valid_label_selectors = [
+            {"ray.io/market_type": "spot"},
+            {"ray.io/accelerator-type": "A100"},
+        ]
+        _validate_bundle_label_selector(valid_label_selectors)
+
+        # Non-list input should raise an exception.
+        with pytest.raises(ValueError, match="must be a list"):
+            _validate_bundle_label_selector("not a list")
+
+        # Empty list should not raise (interpreted as no-op).
+        _validate_bundle_label_selector([])
+
+        # List with non-dictionary elements should raise an exception.
+        with pytest.raises(ValueError, match="must be a list of string dictionary"):
+            _validate_bundle_label_selector(["not a dict", {"valid": "label"}])
+
+        # Dictionary with non-string keys or values should raise an exception.
+        with pytest.raises(ValueError, match="must be a list of string dictionary"):
+            _validate_bundle_label_selector([{1: "value"}, {"key": "val"}])
+        with pytest.raises(ValueError, match="must be a list of string dictionary"):
+            _validate_bundle_label_selector([{"key": 123}, {"valid": "label"}])
+
+        # Invalid label key or value syntax (delegated to validate_label_selector).
+        with pytest.raises(ValueError, match="Invalid label selector provided"):
+            _validate_bundle_label_selector([{"INVALID key!": "value"}])
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main(["-sv", __file__]))

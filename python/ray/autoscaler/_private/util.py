@@ -1,10 +1,11 @@
+import base64
 import collections
 import copy
 import hashlib
 import json
 import logging
 import os
-import re
+import sys
 import threading
 from dataclasses import dataclass
 from datetime import datetime
@@ -14,6 +15,11 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import ray
 import ray._private.services as services
+from ray._common.utils import PLACEMENT_GROUP_BUNDLE_RESOURCE_NAME
+from ray._private.utils import (
+    PLACEMENT_GROUP_INDEXED_BUNDLED_RESOURCE_PATTERN,
+    PLACEMENT_GROUP_WILDCARD_RESOURCE_PATTERN,
+)
 from ray.autoscaler._private import constants
 from ray.autoscaler._private.cli_logger import cli_logger
 from ray.autoscaler._private.docker import validate_docker_config
@@ -23,10 +29,6 @@ from ray.autoscaler.tags import NODE_TYPE_LEGACY_HEAD, NODE_TYPE_LEGACY_WORKER
 
 REQUIRED, OPTIONAL = True, False
 
-PLACEMENT_GROUP_RESOURCE_BUNDLED_PATTERN = re.compile(
-    r"(.+)_group_(\d+)_([0-9a-zA-Z]+)"
-)
-PLACEMENT_GROUP_RESOURCE_PATTERN = re.compile(r"(.+)_group_([0-9a-zA-Z]+)")
 
 HEAD_TYPE_MAX_WORKERS_WARN_TEMPLATE = (
     "Setting `max_workers` for node type"
@@ -78,13 +80,22 @@ Usage = Dict[str, Tuple[Number, Number]]
 logger = logging.getLogger(__name__)
 
 
+def base32hex(data: bytes) -> str:
+    """Encode bytes using base32hex, without padding and in lower case.
+
+    This is used to create a shorter hash string that is compatible with
+    GCP label value constraints (<= 63 chars, lowercase, no padding).
+    """
+    return base64.b32hexencode(data).decode("ascii").lower().rstrip("=")
+
+
 def is_placement_group_resource(resource_name: str) -> bool:
     """
     Check if a resource name is structured like a placement group.
     """
     return bool(
-        PLACEMENT_GROUP_RESOURCE_PATTERN.match(resource_name)
-        or PLACEMENT_GROUP_RESOURCE_BUNDLED_PATTERN.match(resource_name)
+        PLACEMENT_GROUP_WILDCARD_RESOURCE_PATTERN.match(resource_name)
+        or PLACEMENT_GROUP_INDEXED_BUNDLED_RESOURCE_PATTERN.match(resource_name)
     )
 
 
@@ -110,6 +121,7 @@ class LoadMetricsSummary:
     # Optional for deployment modes which have the concept of node types and
     # backwards compatibility.
     node_type_mapping: Optional[Dict[str, str]] = None
+    idle_time_map: Optional[Dict[str, int]] = None
 
 
 class ConcurrentCounter:
@@ -192,6 +204,12 @@ def validate_config(config: Dict[str, Any]) -> None:
                 "sum of `min_workers` of all the available node types."
             )
 
+    if sys.platform == "win32" and config.get("file_mounts_sync_continuously", False):
+        raise ValueError(
+            "`file_mounts_sync_continuously` is not supported on Windows. "
+            "Please set this to False when running on Windows."
+        )
+
 
 def check_legacy_fields(config: Dict[str, Any]) -> None:
     """For use in providers that have completed the migration to
@@ -230,8 +248,17 @@ def prepare_config(config: Dict[str, Any]) -> Dict[str, Any]:
     - Has max_worker set for each node type.
     """
     is_local = config.get("provider", {}).get("type") == "local"
+    is_kuberay = config.get("provider", {}).get("type") == "kuberay"
     if is_local:
-        config = prepare_local(config)
+        config, modified = prepare_local(config)
+        # If the config is already prepared via ray up, return it as is.
+        if not modified:
+            return config
+    elif is_kuberay:
+        # With KubeRay, we don't need to do anything here since KubeRay
+        # generate the autoscaler config from the RayCluster CR instead
+        # of loading from the files.
+        return config
 
     with_defaults = fillout_defaults(config)
     merge_setup_commands(with_defaults)
@@ -396,13 +423,15 @@ def with_envs(cmds: List[str], kv: Dict[str, str]) -> str:
 
     Example:
         with_envs(["echo $FOO"], {"FOO": "BAR"})
-            -> ["FOO=BAR echo $FOO"]
+            -> ["export FOO=BAR; echo $FOO"]
     """
     out_cmds = []
     for cmd in cmds:
         kv_str = ""
         for k, v in kv.items():
-            kv_str += f"{k}={v} "
+            # We will need to do export here so that it works correctly with
+            # shell if the cmd args uses the argument.
+            kv_str += f"export {k}={v}; "
 
         out_cmds.append(f"{kv_str}{cmd}")
     return out_cmds
@@ -415,7 +444,7 @@ def with_head_node_ip(cmds, head_ip=None):
 
 
 def hash_launch_conf(node_conf, auth):
-    hasher = hashlib.sha1()
+    hasher = hashlib.sha256()
     # For hashing, we replace the path to the key with the
     # key itself. This is to make sure the hashes are the
     # same even if keys live at different locations on different
@@ -426,7 +455,7 @@ def hash_launch_conf(node_conf, auth):
             with open(os.path.expanduser(auth[key_type])) as key:
                 full_auth[key_type] = key.read()
     hasher.update(json.dumps([node_conf, full_auth], sort_keys=True).encode("utf-8"))
-    return hasher.hexdigest()
+    return base32hex(hasher.digest())
 
 
 # Cache the file hashes to avoid rescanning it each time. Also, this avoids
@@ -451,8 +480,8 @@ def hash_runtime_conf(
     cluster_synced_files contents have changed. It is used at monitor time to
     determine if additional file syncing is needed.
     """
-    runtime_hasher = hashlib.sha1()
-    contents_hasher = hashlib.sha1()
+    runtime_hasher = hashlib.sha256()
+    contents_hasher = hashlib.sha256()
 
     def add_content_hashes(path, allow_non_existing_paths: bool = False):
         def add_hash_of_file(fpath):
@@ -485,7 +514,7 @@ def hash_runtime_conf(
     if conf_str not in _hash_cache or generate_file_mounts_contents_hash:
         for local_path in sorted(file_mounts.values()):
             add_content_hashes(local_path)
-        head_node_contents_hash = contents_hasher.hexdigest()
+        head_node_contents_hash = base32hex(contents_hasher.digest())
 
         # Generate a new runtime_hash if its not cached
         # The runtime hash does not depend on the cluster_synced_files hash
@@ -494,7 +523,7 @@ def hash_runtime_conf(
         if conf_str not in _hash_cache:
             runtime_hasher.update(conf_str)
             runtime_hasher.update(head_node_contents_hash.encode("utf-8"))
-            _hash_cache[conf_str] = runtime_hasher.hexdigest()
+            _hash_cache[conf_str] = base32hex(runtime_hasher.digest())
 
         # Add cluster_synced_files to the file_mounts_content hash
         if cluster_synced_files is not None:
@@ -504,7 +533,7 @@ def hash_runtime_conf(
                 # anytime over the life of the head node.
                 add_content_hashes(local_path, allow_non_existing_paths=True)
 
-        file_mounts_contents_hash = contents_hasher.hexdigest()
+        file_mounts_contents_hash = base32hex(contents_hasher.digest())
 
     else:
         file_mounts_contents_hash = None
@@ -535,7 +564,7 @@ def format_pg(pg):
 
 def parse_placement_group_resource_str(
     placement_group_resource_str: str,
-) -> Tuple[str, Optional[str]]:
+) -> Tuple[str, Optional[str], bool]:
     """Parse placement group resource in the form of following 3 cases:
     {resource_name}_group_{bundle_id}_{group_name};
     -> This case is ignored as it is duplicated to the case below.
@@ -551,12 +580,14 @@ def parse_placement_group_resource_str(
         have duplicated resource information as
         wildcard resources (resource name without bundle index).
     """
-    result = PLACEMENT_GROUP_RESOURCE_BUNDLED_PATTERN.match(
+    result = PLACEMENT_GROUP_INDEXED_BUNDLED_RESOURCE_PATTERN.match(
         placement_group_resource_str
     )
     if result:
         return (result.group(1), result.group(3), False)
-    result = PLACEMENT_GROUP_RESOURCE_PATTERN.match(placement_group_resource_str)
+    result = PLACEMENT_GROUP_WILDCARD_RESOURCE_PATTERN.match(
+        placement_group_resource_str
+    )
     if result:
         return (result.group(1), result.group(2), True)
     return (placement_group_resource_str, None, True)
@@ -685,9 +716,18 @@ def format_resource_demand_summary(
             using_placement_group,
         ) = filter_placement_group_from_bundle(bundle)
 
-        # bundle is a special keyword for placement group ready tasks
-        # do not report the demand for this.
-        if "bundle" in pg_filtered_bundle.keys():
+        # bundle is a special keyword for placement group scheduling
+        # but it doesn't need to be exposed to users. Remove it from
+        # the demand report.
+        if (
+            using_placement_group
+            and PLACEMENT_GROUP_BUNDLE_RESOURCE_NAME in pg_filtered_bundle.keys()
+        ):
+            del pg_filtered_bundle[PLACEMENT_GROUP_BUNDLE_RESOURCE_NAME]
+
+        # No need to report empty request to demand (e.g.,
+        # placement group ready task).
+        if len(pg_filtered_bundle.keys()) == 0:
             continue
 
         bundle_demand[tuple(sorted(pg_filtered_bundle.items()))] += count
@@ -703,6 +743,36 @@ def format_resource_demand_summary(
     return demand_lines
 
 
+def get_constraint_report(request_demand: List[DictCount]):
+    """Returns a formatted string describing the resource constraints from request_resources().
+
+    Args:
+        request_demand: List of tuples containing resource bundle dictionaries and counts
+            from request_resources() calls.
+
+    Returns:
+        String containing the formatted constraints report, either listing each constraint
+        and count or indicating no constraints exist.
+
+    Example:
+        >>> request_demand = [
+        ...     ({"CPU": 4}, 2),
+        ...     ({"GPU": 1}, 1)
+        ... ]
+        >>> get_constraint_report(request_demand)
+        " {'CPU': 4}: 2 from request_resources()\\n {'GPU': 1}: 1 from request_resources()"
+    """
+    constraint_lines = []
+    for bundle, count in request_demand:
+        line = f" {bundle}: {count} from request_resources()"
+        constraint_lines.append(line)
+    if len(constraint_lines) > 0:
+        constraints_report = "\n".join(constraint_lines)
+    else:
+        constraints_report = " (none)"
+    return constraints_report
+
+
 def get_demand_report(lm_summary: LoadMetricsSummary):
     demand_lines = []
     if lm_summary.resource_demand:
@@ -712,9 +782,6 @@ def get_demand_report(lm_summary: LoadMetricsSummary):
         pg_str = format_pg(pg)
         line = f" {pg_str}: {count}+ pending placement groups"
         demand_lines.append(line)
-    for bundle, count in lm_summary.request_demand:
-        line = f" {bundle}: {count}+ from request_resources()"
-        demand_lines.append(line)
     if len(demand_lines) > 0:
         demand_report = "\n".join(demand_lines)
     else:
@@ -722,9 +789,24 @@ def get_demand_report(lm_summary: LoadMetricsSummary):
     return demand_report
 
 
+def get_per_node_breakdown_as_dict(
+    lm_summary: LoadMetricsSummary,
+) -> dict:
+    per_node_breakdown = {}
+
+    for node_id, usage in lm_summary.usage_by_node.items():
+        usage_string = ""
+        for line in parse_usage(usage, verbose=True):
+            usage_string += f"{line}\n"
+        per_node_breakdown[node_id] = usage_string.strip()
+
+    return per_node_breakdown
+
+
 def get_per_node_breakdown(
     lm_summary: LoadMetricsSummary,
     node_type_mapping: Optional[Dict[str, float]],
+    node_activities: Optional[Dict[str, List[str]]],
     verbose: bool,
 ) -> str:
     sio = StringIO()
@@ -733,17 +815,34 @@ def get_per_node_breakdown(
         node_type_mapping = {}
 
     print(file=sio)
-    for node_ip, usage in lm_summary.usage_by_node.items():
+    for node_id, usage in lm_summary.usage_by_node.items():
         print(file=sio)  # Print a newline.
-        node_string = f"Node: {node_ip}"
-        if node_ip in node_type_mapping:
-            node_type = node_type_mapping[node_ip]
+        node_string = f"Node: {node_id}"
+        if node_id in node_type_mapping:
+            node_type = node_type_mapping[node_id]
             node_string += f" ({node_type})"
-
         print(node_string, file=sio)
+        if (
+            lm_summary.idle_time_map
+            and node_id in lm_summary.idle_time_map
+            and lm_summary.idle_time_map[node_id] > 0
+        ):
+            print(f" Idle: {lm_summary.idle_time_map[node_id]} ms", file=sio)
+
         print(" Usage:", file=sio)
         for line in parse_usage(usage, verbose):
             print(f"  {line}", file=sio)
+        # Don't print anything if not provided.
+        if not node_activities:
+            continue
+        print(" Activity:", file=sio)
+        if node_id not in node_activities:
+            print("  (no activity)", file=sio)
+        else:
+            # Note: We have node IP here.
+            _, reasons = node_activities[node_id]
+            for reason in reasons:
+                print(f"  {reason}", file=sio)
 
     return sio.getvalue()
 
@@ -774,10 +873,22 @@ def format_info_string(
             header += "Autoscaler iteration time: " f"{autoscaler_update_time:3f}s\n"
 
     available_node_report_lines = []
-    for node_type, count in autoscaler_summary.active_nodes.items():
-        line = f" {count} {node_type}"
-        available_node_report_lines.append(line)
-    available_node_report = "\n".join(available_node_report_lines)
+    if not autoscaler_summary.active_nodes:
+        available_node_report = " (no active nodes)"
+    else:
+        for node_type, count in autoscaler_summary.active_nodes.items():
+            line = f" {count} {node_type}"
+            available_node_report_lines.append(line)
+        available_node_report = "\n".join(available_node_report_lines)
+
+    if not autoscaler_summary.idle_nodes:
+        idle_node_report = " (no idle nodes)"
+    else:
+        idle_node_report_lines = []
+        for node_type, count in autoscaler_summary.idle_nodes.items():
+            line = f" {count} {node_type}"
+            idle_node_report_lines.append(line)
+        idle_node_report = "\n".join(idle_node_report_lines)
 
     pending_lines = []
     for node_type, count in autoscaler_summary.pending_launches.items():
@@ -793,7 +904,7 @@ def format_info_string(
 
     failure_lines = []
     for ip, node_type in autoscaler_summary.failed_nodes:
-        line = f" {node_type}: RayletUnexpectedlyDied (ip: {ip})"
+        line = f" {node_type}: NodeTerminated (ip: {ip})"
         failure_lines.append(line)
     if autoscaler_summary.node_availability_summary:
         records = sorted(
@@ -828,28 +939,43 @@ def format_info_string(
         failure_report += " (no failures)"
 
     usage_report = get_usage_report(lm_summary, verbose)
+    constraints_report = get_constraint_report(lm_summary.request_demand)
     demand_report = get_demand_report(lm_summary)
-
     formatted_output = f"""{header}
 Node status
 {separator}
-Healthy:
-{available_node_report}
+Active:
+{available_node_report}"""
+
+    if not autoscaler_summary.legacy:
+        formatted_output += f"""
+Idle:
+{idle_node_report}"""
+
+    formatted_output += f"""
 Pending:
 {pending_report}
 {failure_report}
 
 Resources
 {separator}
-{"Total " if verbose else ""}Usage:
+Total Usage:
 {usage_report}
-{"Total " if verbose else ""}Demands:
+From request_resources:
+{constraints_report}
+Pending Demands:
 {demand_report}"""
 
-    if verbose and lm_summary.usage_by_node:
-        formatted_output += get_per_node_breakdown(
-            lm_summary, autoscaler_summary.node_type_mapping, verbose
-        )
+    if verbose:
+        if lm_summary.usage_by_node:
+            formatted_output += get_per_node_breakdown(
+                lm_summary,
+                autoscaler_summary.node_type_mapping,
+                autoscaler_summary.node_activities,
+                verbose,
+            )
+        else:
+            formatted_output += "\n"
 
     return formatted_output.strip()
 
@@ -884,3 +1010,47 @@ def format_no_node_type_string(node_type: dict):
         output_lines.append(output_line)
 
     return "\n  ".join(output_lines)
+
+
+def generate_rsa_key_pair():
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(
+        backend=default_backend(), public_exponent=65537, key_size=2048
+    )
+
+    public_key = (
+        key.public_key()
+        .public_bytes(
+            serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH
+        )
+        .decode("utf-8")
+    )
+
+    pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("utf-8")
+
+    return public_key, pem
+
+
+def generate_ssh_key_paths(key_name):
+    public_key_path = os.path.expanduser("~/.ssh/{}.pub".format(key_name))
+    private_key_path = os.path.expanduser("~/.ssh/{}".format(key_name))
+    return public_key_path, private_key_path
+
+
+def generate_ssh_key_name(provider, i, region, identifier, ssh_user):
+    RAY_PREFIX = "ray-autoscaler"
+    if i is not None:
+        return "{}_{}_{}_{}_{}_{}".format(
+            RAY_PREFIX, provider, region, identifier, ssh_user, i
+        )
+    else:
+        return "{}_{}_{}_{}_{}".format(
+            RAY_PREFIX, provider, region, identifier, ssh_user
+        )

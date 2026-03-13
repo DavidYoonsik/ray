@@ -1,25 +1,26 @@
 import logging
+from typing import Callable, List, Optional, Set, Tuple, Union
+
 import gymnasium as gym
 import numpy as np
-from typing import Callable, List, Optional, Tuple, Union, Set
 
-from ray.rllib.env.base_env import BaseEnv, _DUMMY_AGENT_ID
-from ray.rllib.utils.annotations import Deprecated, override, PublicAPI
+from ray.rllib.env.base_env import _DUMMY_AGENT_ID, BaseEnv
+from ray.rllib.utils.annotations import Deprecated, OldAPIStack, override
 from ray.rllib.utils.typing import (
+    AgentID,
     EnvActionType,
     EnvID,
     EnvInfoDict,
     EnvObsType,
     EnvType,
     MultiEnvDict,
-    AgentID,
 )
 from ray.util import log_once
 
 logger = logging.getLogger(__name__)
 
 
-@PublicAPI
+@OldAPIStack
 class VectorEnv:
     """An environment that supports batch evaluation using clones of sub-envs."""
 
@@ -81,7 +82,6 @@ class VectorEnv:
             restart_failed_sub_environments=restart_failed_sub_environments,
         )
 
-    @PublicAPI
     def vector_reset(
         self, *, seeds: Optional[List[int]] = None, options: Optional[List[dict]] = None
     ) -> Tuple[List[EnvObsType], List[EnvInfoDict]]:
@@ -100,7 +100,6 @@ class VectorEnv:
         """
         raise NotImplementedError
 
-    @PublicAPI
     def reset_at(
         self,
         index: Optional[int] = None,
@@ -126,7 +125,6 @@ class VectorEnv:
         """
         raise NotImplementedError
 
-    @PublicAPI
     def restart_at(self, index: Optional[int] = None) -> None:
         """Restarts a single sub-environment.
 
@@ -135,7 +133,6 @@ class VectorEnv:
         """
         raise NotImplementedError
 
-    @PublicAPI
     def vector_step(
         self, actions: List[EnvActionType]
     ) -> Tuple[
@@ -156,7 +153,6 @@ class VectorEnv:
         """
         raise NotImplementedError
 
-    @PublicAPI
     def get_sub_environments(self) -> List[EnvType]:
         """Returns the underlying sub environments.
 
@@ -178,7 +174,6 @@ class VectorEnv:
         """
         pass
 
-    @PublicAPI
     def to_base_env(
         self,
         make_env: Optional[Callable[[int], EnvType]] = None,
@@ -224,6 +219,7 @@ class VectorEnv:
         pass
 
 
+@OldAPIStack
 class _VectorizedGymEnv(VectorEnv):
     """Internal wrapper to translate any gym.Envs into a VectorEnv object."""
 
@@ -329,6 +325,9 @@ class _VectorizedGymEnv(VectorEnv):
                     "Trying to close old and replaced sub-environment (at vector "
                     f"index={index}), but closing resulted in error:\n{e}"
                 )
+        env_to_del = self.envs[index]
+        self.envs[index] = None
+        del env_to_del
 
         # Re-create the sub-env at the new index.
         logger.warning(f"Trying to restart sub-environment at index {index}.")
@@ -383,7 +382,7 @@ class _VectorizedGymEnv(VectorEnv):
         return self.envs[index].render()
 
 
-@PublicAPI
+@OldAPIStack
 class VectorEnvWrapper(BaseEnv):
     """Internal adapter of VectorEnv to BaseEnv.
 
@@ -500,10 +499,7 @@ class VectorEnvWrapper(BaseEnv):
         if not as_dict:
             return self.vector_env.get_sub_environments()
         else:
-            return {
-                _id: env
-                for _id, env in enumerate(self.vector_env.get_sub_environments())
-            }
+            return dict(enumerate(self.vector_env.get_sub_environments()))
 
     @override(BaseEnv)
     def try_render(self, env_id: Optional[EnvID] = None) -> None:
@@ -512,30 +508,15 @@ class VectorEnvWrapper(BaseEnv):
 
     @property
     @override(BaseEnv)
-    @PublicAPI
     def observation_space(self) -> gym.Space:
         return self._observation_space
 
     @property
     @override(BaseEnv)
-    @PublicAPI
     def action_space(self) -> gym.Space:
         return self._action_space
 
     @override(BaseEnv)
-    @PublicAPI
-    def action_space_sample(self, agent_id: list = None) -> MultiEnvDict:
-        del agent_id
-        return {0: {_DUMMY_AGENT_ID: self._action_space.sample()}}
-
-    @override(BaseEnv)
-    @PublicAPI
-    def observation_space_sample(self, agent_id: list = None) -> MultiEnvDict:
-        del agent_id
-        return {0: {_DUMMY_AGENT_ID: self._observation_space.sample()}}
-
-    @override(BaseEnv)
-    @PublicAPI
     def get_agent_ids(self) -> Set[AgentID]:
         return {_DUMMY_AGENT_ID}
 

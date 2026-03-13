@@ -1,17 +1,15 @@
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from dataclasses import dataclass
-
 import ray
-from ray import SCRIPT_MODE, LOCAL_MODE
+from ray import SCRIPT_MODE
 from ray.air.execution.resources.request import (
-    ResourceRequest,
     AcquiredResources,
     RemoteRayEntity,
+    ResourceRequest,
 )
 from ray.air.execution.resources.resource_manager import ResourceManager
 from ray.util.annotations import DeveloperAPI
-
 
 # Avoid numerical errors by multiplying and subtracting with this number.
 # Compare: 0.99 - 0.33 = 0.65999... vs (0.99 * 1000 - 0.33 * 1000) / 1000 = 0.66
@@ -72,7 +70,7 @@ class FixedResourceManager(ResourceManager):
         rtc = ray.get_runtime_context()
 
         if not total_resources:
-            if rtc.worker.mode in {None, SCRIPT_MODE, LOCAL_MODE}:
+            if rtc.worker.mode in {None, SCRIPT_MODE}:
                 total_resources = ray.cluster_resources()
             else:
                 total_resources = rtc.get_assigned_resources()

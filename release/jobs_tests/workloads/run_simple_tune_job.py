@@ -15,7 +15,7 @@ def training_function(config):
         # Iterative training function - can be any arbitrary training procedure.
         intermediate_score = objective(step, alpha, beta)
         # Feed the score back back to Tune.
-        tune.report(mean_loss=intermediate_score)
+        tune.report(dict(mean_loss=intermediate_score))
 
 
 ray.init(address="auto")

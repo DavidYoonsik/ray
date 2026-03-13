@@ -2,13 +2,13 @@ import collections
 import hashlib
 import json
 import os
-import random
-import string
 import subprocess
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import requests
+
+from ray_release.configs.global_config import get_global_config
 from ray_release.logger import logger
 
 if TYPE_CHECKING:
@@ -27,11 +27,43 @@ class DeferredEnvVar:
 ANYSCALE_HOST = DeferredEnvVar("ANYSCALE_HOST", "https://console.anyscale.com")
 S3_CLOUD_STORAGE = "s3"
 GS_CLOUD_STORAGE = "gs"
+AZURE_CLOUD_STORAGE = "abfss"
+AZURE_STORAGE_CONTAINER = "working-dirs"
+AZURE_STORAGE_ACCOUNT = "rayreleasetests"
 GS_BUCKET = "anyscale-oss-dev-bucket"
+AZURE_REGISTRY_NAME = "rayreleasetest"
+ANYSCALE_RAY_IMAGE_PREFIX = "anyscale/ray"
 ERROR_LOG_PATTERNS = [
     "ERROR",
     "Traceback (most recent call last)",
 ]
+KUBERAY_SERVER_URL = "https://kuberaytest.anyscale.dev"
+DEFAULT_KUBERAY_NAMESPACE = "kuberayportal-kevin"
+
+
+def get_read_state_machine_aws_bucket(allow_pr_bucket: bool = False) -> str:
+    # We support by default reading from the branch bucket only, since most of the use
+    # cases are on branch pipelines. Changing the default flag to read from the bucket
+    # according to the current pipeline
+    if allow_pr_bucket:
+        return get_write_state_machine_aws_bucket()
+    return get_global_config()["state_machine_branch_aws_bucket"]
+
+
+def get_write_state_machine_aws_bucket() -> str:
+    # We support different buckets for writing test result data; one for pr and one for
+    # branch. This is because pr and branch pipeline have different permissions, and we
+    # want data on branch pipeline being protected.
+    pipeline_id = os.environ.get("BUILDKITE_PIPELINE_ID")
+    pr_pipelines = get_global_config()["ci_pipeline_premerge"]
+    branch_pipelines = get_global_config()["ci_pipeline_postmerge"]
+    assert pipeline_id in pr_pipelines + branch_pipelines, (
+        "Test state machine is only supported for branch or pr pipeline, "
+        f"{pipeline_id} is given"
+    )
+    if pipeline_id in pr_pipelines:
+        return get_global_config()["state_machine_pr_aws_bucket"]
+    return get_global_config()["state_machine_branch_aws_bucket"]
 
 
 def deep_update(d, u) -> Dict:
@@ -48,14 +80,6 @@ def dict_hash(dt: Dict[Any, Any]) -> str:
     sha = hashlib.sha256()
     sha.update(json_str.encode())
     return sha.hexdigest()
-
-
-def url_exists(url: str) -> bool:
-    try:
-        return requests.head(url, allow_redirects=True).status_code == 200
-    except requests.exceptions.RequestException:
-        logger.exception(f"Failed to check url exists: {url}")
-        return False
 
 
 def resolve_url(url: str) -> str:
@@ -77,22 +101,6 @@ def anyscale_project_url(project_id: str) -> str:
         f"{ANYSCALE_HOST}"
         f"/o/anyscale-internal/projects/{project_id}"
         f"/?tab=session-list"
-    )
-
-
-def anyscale_cluster_url(project_id: str, cluster_id: str) -> str:
-    return (
-        f"{ANYSCALE_HOST}"
-        f"/o/anyscale-internal/projects/{project_id}"
-        f"/clusters/{cluster_id}"
-    )
-
-
-def anyscale_cluster_compute_url(compute_tpl_id: str) -> str:
-    return (
-        f"{ANYSCALE_HOST}"
-        f"/o/anyscale-internal/configurations/cluster-computes"
-        f"/{compute_tpl_id}"
     )
 
 
@@ -164,19 +172,3 @@ def get_pip_packages() -> List[str]:
 def python_version_str(python_version: Tuple[int, int]) -> str:
     """From (X, Y) to XY"""
     return "".join([str(x) for x in python_version])
-
-
-def generate_tmp_cloud_storage_path() -> str:
-    return "".join(random.choice(string.ascii_lowercase) for i in range(10))
-
-
-def join_cloud_storage_paths(*paths: str):
-    paths = list(paths)
-    if len(paths) > 1:
-        for i in range(1, len(paths)):
-            while paths[i][0] == "/":
-                paths[i] = paths[i][1:]
-    joined_path = os.path.join(*paths)
-    while joined_path[-1] == "/":
-        joined_path = joined_path[:-1]
-    return joined_path

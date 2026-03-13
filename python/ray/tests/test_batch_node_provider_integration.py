@@ -1,21 +1,21 @@
 """Integration/e2e test for BatchingNodeProvider.
 Adapts FakeMultiNodeProvider tests.
 """
-from copy import deepcopy
+import logging
 import sys
+from copy import deepcopy
 
 import pytest
 
-
 import ray
-from ray._private.test_utils import wait_for_condition
+from ray._common.test_utils import wait_for_condition
+from ray.autoscaler._private.constants import FOREGROUND_NODE_LAUNCH_KEY
+from ray.autoscaler._private.fake_multi_node.node_provider import FakeMultiNodeProvider
 from ray.autoscaler.batching_node_provider import (
     BatchingNodeProvider,
     NodeData,
     ScaleRequest,
 )
-from ray.autoscaler._private.fake_multi_node.node_provider import FakeMultiNodeProvider
-from ray.autoscaler._private.constants import FOREGROUND_NODE_LAUNCH_KEY
 from ray.autoscaler.tags import (
     NODE_KIND_WORKER,
     STATUS_UP_TO_DATE,
@@ -25,15 +25,12 @@ from ray.autoscaler.tags import (
 )
 from ray.cluster_utils import AutoscalingCluster
 
-
-import logging
-
 logger = logging.getLogger(__name__)
 
 
 class FakeBatchingNodeProvider(BatchingNodeProvider):
     """Class for e2e local testing of BatchingNodeProvider.
-    Recycles parts of the implementation of FakeMultiNodeProvider without inheriting it.
+    Uses FakeMultiNodeProvider as a proxy for managing the nodes.
 
     This node provider requires the "available_node_types" section of the
     autoscaling config to be copied into the "provider" section.
@@ -46,20 +43,22 @@ class FakeBatchingNodeProvider(BatchingNodeProvider):
 
     def __init__(self, provider_config, cluster_name):
         BatchingNodeProvider.__init__(self, provider_config, cluster_name)
-        FakeMultiNodeProvider.__init__(self, provider_config, cluster_name)
+        self.fake_multi_node_provider = FakeMultiNodeProvider(
+            provider_config, cluster_name
+        )
 
     # Manually "inherit" internal utility functions.
     # I prefer this over attempting multiple inheritance.
     def _next_hex_node_id(self):
-        return FakeMultiNodeProvider._next_hex_node_id(self)
+        return self.fake_multi_node_provider._next_hex_node_id()
 
     def _terminate_node(self, node):
-        return FakeMultiNodeProvider._terminate_node(self, node)
+        return self.fake_multi_node_provider._terminate_node(node)
 
     def get_node_data(self):
         node_data_dict = {}
-        for node_id in self._nodes:
-            tags = self._nodes[node_id]["tags"]
+        for node_id in self.fake_multi_node_provider._nodes:
+            tags = self.fake_multi_node_provider._nodes[node_id]["tags"]
             node_data_dict[node_id] = NodeData(
                 kind=tags[TAG_RAY_NODE_KIND],
                 type=tags[TAG_RAY_USER_NODE_TYPE],
@@ -83,13 +82,20 @@ class FakeBatchingNodeProvider(BatchingNodeProvider):
             resources = self.provider_config["available_node_types"][node_type][
                 "resources"
             ]
+            labels = self.provider_config["available_node_types"][node_type].get(
+                "labels", {}
+            )
             tags = {
                 TAG_RAY_NODE_KIND: NODE_KIND_WORKER,
                 TAG_RAY_USER_NODE_TYPE: node_type,
                 TAG_RAY_NODE_STATUS: STATUS_UP_TO_DATE,
             }
-            FakeMultiNodeProvider.create_node_with_resources(
-                self, node_config={}, tags=tags, count=diff, resources=resources
+            self.fake_multi_node_provider.create_node_with_resources_and_labels(
+                node_config={},
+                tags=tags,
+                count=diff,
+                resources=resources,
+                labels=labels,
             )
 
 
@@ -108,9 +114,9 @@ class BatchingAutoscalingCluster(AutoscalingCluster):
         )
         # Load the node provider class above.
         config["provider"]["type"] = "external"
-        config["provider"]["module"] = (
-            "ray.tests." "test_batch_node_provider_integration.FakeBatchingNodeProvider"
-        )
+        config["provider"][
+            "module"
+        ] = "ray.tests.test_batch_node_provider_integration.FakeBatchingNodeProvider"
         # Need to run in single threaded mode to use BatchingNodeProvider.
         config["provider"][FOREGROUND_NODE_LAUNCH_KEY] = True
         return config
@@ -169,10 +175,4 @@ def test_fake_batching_autoscaler_e2e(shutdown_only):
 
 
 if __name__ == "__main__":
-    import os
-    import sys
-
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

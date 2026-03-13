@@ -1,1004 +1,1270 @@
-from abc import ABC
 import asyncio
-from collections import defaultdict, deque
-from dataclasses import dataclass
-import itertools
+import concurrent.futures
 import logging
-import math
-import pickle
-import random
+import threading
+import time
+import weakref
+from abc import ABC, abstractmethod
+from asyncio import AbstractEventLoop, ensure_future, futures
+from collections import defaultdict
+from collections.abc import MutableMapping
+from contextlib import contextmanager
+from functools import lru_cache, partial
 from typing import (
     Any,
-    AsyncGenerator,
+    Callable,
+    Coroutine,
     DefaultDict,
-    Deque,
     Dict,
     List,
     Optional,
-    Set,
-    Tuple,
     Union,
 )
-import warnings
-
-from starlette.requests import Request
 
 import ray
 from ray.actor import ActorHandle
-from ray.dag.py_obj_scanner import _PyObjScanner
-from ray.exceptions import RayActorError, RayTaskError
-from ray.util import metrics
-from ray._private.utils import make_asyncio_event_version_compat
-
-from ray.serve._private.common import RunningReplicaInfo, DeploymentInfo
+from ray.exceptions import ActorDiedError, ActorUnavailableError, RayError
+from ray.serve._private.common import (
+    RUNNING_REQUESTS_KEY,
+    DeploymentHandleSource,
+    DeploymentID,
+    DeploymentTargetInfo,
+    HandleMetricReport,
+    ReplicaID,
+    RequestMetadata,
+    RunningReplicaInfo,
+)
+from ray.serve._private.config import DeploymentConfig
 from ray.serve._private.constants import (
+    RAY_SERVE_AUTOSCALING_METRIC_RECORD_INTERVAL_FACTOR,
+    RAY_SERVE_COLLECT_AUTOSCALING_METRICS_ON_HANDLE,
+    RAY_SERVE_METRICS_EXPORT_INTERVAL_MS,
+    RAY_SERVE_PROXY_PREFER_LOCAL_AZ_ROUTING,
     SERVE_LOGGER_NAME,
-    HANDLE_METRIC_PUSH_INTERVAL_S,
 )
-from ray.serve._private.http_util import make_buffered_asgi_receive
+from ray.serve._private.event_loop_monitoring import EventLoopMonitor
 from ray.serve._private.long_poll import LongPollClient, LongPollNamespace
-from ray.serve._private.utils import (
-    compute_iterable_delta,
-    JavaActorHandleProxy,
+from ray.serve._private.metrics_utils import (
+    QUEUED_REQUESTS_KEY,
+    InMemoryMetricsStore,
     MetricsPusher,
+    TimeStampedValue,
 )
-from ray.serve.generated.serve_pb2 import (
-    DeploymentRoute,
-    RequestMetadata as RequestMetadataProto,
+from ray.serve._private.replica_result import ReplicaResult
+from ray.serve._private.request_router import PendingRequest, RequestRouter
+from ray.serve._private.request_router.pow_2_router import (
+    PowerOfTwoChoicesRequestRouter,
 )
+from ray.serve._private.request_router.replica_wrapper import RunningReplica
+from ray.serve._private.tracing_utils import (
+    create_propagated_context,
+    is_span_recording,
+    set_http_span_attributes,
+    set_rpc_span_attributes,
+    set_span_attributes,
+    set_span_exception,
+    set_span_name,
+    tracing_decorator_factory,
+)
+from ray.serve._private.usage import ServeUsageTag
+from ray.serve._private.utils import (
+    check_obj_ref_ready_nowait,
+    compress_metric_report,
+    generate_request_id,
+    resolve_deployment_response,
+)
+from ray.serve.config import AutoscalingConfig
+from ray.serve.exceptions import BackPressureError, DeploymentUnavailableError
+from ray.types import ObjectRef
+from ray.util import metrics
 
 logger = logging.getLogger(SERVE_LOGGER_NAME)
 
-# Used to only print a single warning when users pass starlette requests via handle.
-WARNED_ABOUT_STARLETTE_REQUESTS_ONCE = False
 
+class RouterMetricsManager:
+    """Manages metrics for the router."""
 
-@dataclass
-class RequestMetadata:
-    request_id: str
-    endpoint: str
-    call_method: str = "__call__"
-
-    # This flag is set if the request is made from the HTTP proxy to a replica.
-    is_http_request: bool = False
-
-    # HTTP route path of the request.
-    route: str = ""
-
-    # Application name.
-    app_name: str = ""
-
-    # Multiplexed model ID.
-    multiplexed_model_id: str = ""
-
-    # If this request expects a streaming response.
-    is_streaming: bool = False
-
-
-@dataclass
-class Query:
-    args: List[Any]
-    kwargs: Dict[Any, Any]
-    metadata: RequestMetadata
-
-    async def resolve_async_tasks(self):
-        """Find all unresolved asyncio.Task and gather them all at once."""
-        scanner = _PyObjScanner(source_type=asyncio.Task)
-
-        try:
-            tasks = scanner.find_nodes((self.args, self.kwargs))
-
-            if len(tasks) > 0:
-                resolved = await asyncio.gather(*tasks)
-                replacement_table = dict(zip(tasks, resolved))
-                self.args, self.kwargs = scanner.replace_nodes(replacement_table)
-        finally:
-            # Make the scanner GC-able to avoid memory leaks.
-            scanner.clear()
-
-    async def buffer_starlette_requests_and_warn(self):
-        """Buffer any `starlette.request.Requests` objects to make them serializable.
-
-        This is an anti-pattern because the requests will not be fully functional, so
-        warn the user. We may fully disallow it in the future.
-        """
-        global WARNED_ABOUT_STARLETTE_REQUESTS_ONCE
-        scanner = _PyObjScanner(source_type=Request)
-
-        try:
-            requests = scanner.find_nodes((self.args, self.kwargs))
-            if len(requests) > 0 and not WARNED_ABOUT_STARLETTE_REQUESTS_ONCE:
-                WARNED_ABOUT_STARLETTE_REQUESTS_ONCE = True
-                # TODO(edoakes): fully disallow this in the future.
-                warnings.warn(
-                    "`starlette.Request` objects should not be directly passed via "
-                    "`ServeHandle` calls. Not all functionality is guaranteed to work "
-                    "(e.g., detecting disconnects) and this may be disallowed in a "
-                    "future release."
-                )
-
-            for request in requests:
-
-                async def empty_send():
-                    pass
-
-                request._send = empty_send
-                request._receive = make_buffered_asgi_receive(await request.body())
-        finally:
-            # Make the scanner GC-able to avoid memory leaks.
-            scanner.clear()
-
-
-class ReplicaWrapper(ABC):
-    """Defines the interface for a scheduler to talk to a replica.
-
-    This is used to abstract away details of Ray actor calls for testing.
-    """
-
-    @property
-    def replica_id(self) -> str:
-        """Replica ID of this replica."""
-        pass
-
-    @property
-    def multiplexed_model_ids(self) -> Set[str]:
-        """Set of model IDs on this replica."""
-        pass
-
-    async def get_queue_state(self) -> Tuple[int, bool]:
-        """Returns tuple of (queue_len, accepted)."""
-        pass
-
-    def send_query(
-        self, query: Query
-    ) -> Union[ray.ObjectRef, "ray._raylet.StreamingObjectRefGenerator"]:
-        """Send query to this replica."""
-        pass
-
-
-class ActorReplicaWrapper:
-    def __init__(self, replica_info: RunningReplicaInfo):
-        self._replica_info = replica_info
-        self._multiplexed_model_ids = set(replica_info.multiplexed_model_ids)
-
-        if replica_info.is_cross_language:
-            self._actor_handle = JavaActorHandleProxy(replica_info.actor_handle)
-        else:
-            self._actor_handle = replica_info.actor_handle
-
-    @property
-    def replica_id(self) -> str:
-        return self._replica_info.replica_tag
-
-    @property
-    def multiplexed_model_ids(self) -> Set[str]:
-        return self._multiplexed_model_ids
-
-    async def get_queue_state(self) -> Tuple[int, bool]:
-        # NOTE(edoakes): the `get_num_ongoing_requests` method name is shared by
-        # the Python and Java replica implementations. If you change it, you need to
-        # change both (or introduce a branch here).
-        queue_len = await self._actor_handle.get_num_ongoing_requests.remote()
-        accepted = queue_len < self._replica_info.max_concurrent_queries
-        return queue_len, accepted
-
-    def _send_query_java(self, query: Query) -> ray.ObjectRef:
-        """Send the query to a Java replica.
-
-        Does not currently support streaming.
-        """
-        if query.metadata.is_streaming:
-            raise RuntimeError("Streaming not supported for Java.")
-
-        # Java only supports a single argument.
-        arg = query.args[0]
-
-        # Convert HTTP requests to Java-accepted format (single string).
-        if query.metadata.is_http_request:
-            assert isinstance(arg, bytes)
-            loaded_http_input = pickle.loads(arg)
-            query_string = loaded_http_input.scope.get("query_string")
-            if query_string:
-                arg = query_string.decode().split("=", 1)[1]
-            elif loaded_http_input.body:
-                arg = loaded_http_input.body.decode()
-
-        # Default call method in java is "call," not "__call__" like Python.
-        call_method = query.metadata.call_method
-        if call_method == "__call__":
-            call_method = "call"
-
-        return self._actor_handle.handle_request.remote(
-            RequestMetadataProto(
-                request_id=query.metadata.request_id,
-                endpoint=query.metadata.endpoint,
-                call_method=call_method,
-            ).SerializeToString(),
-            [arg],
-        )
-
-    def _send_query_python(
-        self, query: Query
-    ) -> Union[ray.ObjectRef, "ray._raylet.StreamingObjectRefGenerator"]:
-        """Send the query to a Python replica."""
-        if query.metadata.is_streaming:
-            obj_ref = self._actor_handle.handle_request_streaming.options(
-                num_returns="streaming"
-            ).remote(pickle.dumps(query.metadata), *query.args, **query.kwargs)
-        else:
-            _, obj_ref = self._actor_handle.handle_request.remote(
-                pickle.dumps(query.metadata), *query.args, **query.kwargs
-            )
-
-        return obj_ref
-
-    def send_query(
-        self, query: Query
-    ) -> Union[ray.ObjectRef, "ray._raylet.StreamingObjectRefGenerator"]:
-        if self._replica_info.is_cross_language:
-            return self._send_query_java(query)
-        else:
-            return self._send_query_python(query)
-
-
-class ReplicaScheduler(ABC):
-    """Abstract interface for a replica scheduler (how the router calls it)."""
-
-    async def assign_replica(
-        self, query: Query
-    ) -> Union[ray.ObjectRef, "ray._raylet.StreamingObjectRefGenerator"]:
-        pass
-
-    def update_running_replicas(self, running_replicas: List[RunningReplicaInfo]):
-        pass
-
-
-@dataclass
-class PendingRequest:
-    future: asyncio.Future
-    metadata: RequestMetadata
-
-
-class PowerOfTwoChoicesReplicaScheduler(ReplicaScheduler):
-    """Chooses a replica for each request using the "power of two choices" procedure.
-
-    Requests are scheduled in FIFO order.
-
-    When a request comes in, two candidate replicas are chosen randomly. Each replica
-    is sent a control message to fetch its queue length.
-
-    The replica responds with two items: (queue_length, accepted). Only replicas that
-    accept the request are considered; between those, the one with the lower queue
-    length is chosen.
-
-    In the case when neither replica accepts the request (e.g., their queues are full),
-    the procedure is repeated with backoff. This backoff repeats indefinitely until a
-    replica is chosen, so the caller should use timeouts and cancellation to avoid
-    hangs.
-
-    Each request being scheduled may spawn an independent task that runs the scheduling
-    procedure concurrently. This task will not necessarily satisfy the request that
-    started it (in order to maintain the FIFO order). The total number of tasks is
-    capped at (2 * num_replicas).
-    """
-
-    # The sequence of backoff timeouts to use when all replicas' queues are full.
-    # The last item in the list is the max timeout and will be used repeatedly.
-    backoff_sequence_s = [0, 0.05, 0.1, 0.15, 0.2, 0.5, 1.0]
-
-    # Deadline for replicas to respond with their queue length. If the response isn't
-    # received within this deadline, the replica will not be considered.
-    queue_len_response_deadline_s = 0.1
+    PUSH_METRICS_TO_CONTROLLER_TASK_NAME = "push_metrics_to_controller"
+    RECORD_METRICS_TASK_NAME = "record_metrics"
 
     def __init__(
         self,
-        event_loop: asyncio.AbstractEventLoop,
-        deployment_name: str,
+        deployment_id: DeploymentID,
+        handle_id: str,
+        self_actor_id: str,
+        handle_source: DeploymentHandleSource,
+        controller_handle: ActorHandle,
+        router_requests_counter: metrics.Counter,
+        queued_requests_gauge: metrics.Gauge,
+        running_requests_gauge: metrics.Gauge,
+        event_loop: asyncio.BaseEventLoop,
     ):
-        self._loop = event_loop
-        self._deployment_name = deployment_name
+        self._handle_id = handle_id
+        self._deployment_id = deployment_id
+        self._self_actor_id = self_actor_id
+        self._handle_source = handle_source
+        self._controller_handle = controller_handle
 
-        # Current replicas available to be scheduled.
-        # Updated via `update_replicas`.
-        self._replica_id_set: Set[str] = set()
-        self._replicas: Dict[str, ReplicaWrapper] = {}
-        self._replicas_updated_event = make_asyncio_event_version_compat(event_loop)
-        self._multiplexed_model_id_to_replica_ids: DefaultDict[Set[str]] = defaultdict(
-            set
+        # Exported metrics
+        self.num_router_requests = router_requests_counter
+        self.num_router_requests.set_default_tags(
+            {
+                "deployment": deployment_id.name,
+                "application": deployment_id.app_name,
+                "handle": self._handle_id,
+                "actor_id": self._self_actor_id,
+            }
         )
 
-        # Tasks running the scheduling loop. The size of this set may vary over time
-        # as new tasks will be scheduled when a request comes in or new replicas are
-        # added, but it will not exceed self.max_num_scheduling_tasks.
-        self._scheduling_tasks: Set[asyncio.Task] = set()
-
-        # We keep two separate queues of pending requests:
-        # - self._pending_requests_to_fulfill is a queue that will be used to fulfill
-        # requests in FIFO order by scheduling tasks once they've acquired a replica.
-        # To avoid long tail latencies due to backoff, the scheduling task started by
-        # a given request may not be the one to fulfill it.
-        # - self._pending_requests_to_schedule is a queue that is used for tasks to
-        # best-effort grab the metadata of requests waiting to be fulfilled. This is
-        # currently used for scheduling tasks to know which multiplexed model IDs they
-        # should be trying to get replicas for.
-        self._pending_requests_to_fulfill: Deque[PendingRequest] = deque()
-        self._pending_requests_to_schedule: Deque[PendingRequest] = deque()
-
-    @property
-    def num_pending_requests(self) -> int:
-        """Current number of requests pending assignment."""
-        return len(self._pending_requests_to_fulfill)
-
-    @property
-    def curr_num_scheduling_tasks(self) -> int:
-        """Current number of scheduling tasks running."""
-        return len(self._scheduling_tasks)
-
-    @property
-    def max_num_scheduling_tasks(self) -> int:
-        """Max number of scheduling tasks to run at any time."""
-        return 2 * len(self._replicas)
-
-    @property
-    def target_num_scheduling_tasks(self) -> int:
-        """Target number of scheduling tasks to be running based on pending requests.
-
-        This will never exceed `self.max_num_scheduling_tasks`.
-        """
-        return min(self.num_pending_requests, self.max_num_scheduling_tasks)
-
-    @property
-    def curr_replicas(self) -> Dict[str, ReplicaWrapper]:
-        return self._replicas
-
-    def update_replicas(self, replicas: List[ReplicaWrapper]):
-        """Update the set of available replicas to be considered for scheduling.
-
-        When the set of replicas changes, we may spawn additional scheduling tasks
-        if there are pending requests.
-        """
-        new_replicas = {}
-        new_replica_id_set = set()
-        new_multiplexed_model_id_to_replica_ids = defaultdict(set)
-        for r in replicas:
-            new_replicas[r.replica_id] = r
-            new_replica_id_set.add(r.replica_id)
-            for model_id in r.multiplexed_model_ids:
-                new_multiplexed_model_id_to_replica_ids[model_id].add(r.replica_id)
-
-        if self._replica_id_set != new_replica_id_set:
-            logger.info(
-                "Got updated replicas for deployment "
-                f"{self._deployment_name}: {new_replica_id_set}.",
-                extra={"log_to_stderr": False},
-            )
-
-        self._replicas = new_replicas
-        self._replica_id_set = new_replica_id_set
-        self._multiplexed_model_id_to_replica_ids = (
-            new_multiplexed_model_id_to_replica_ids
+        self.num_queued_requests = 0
+        self.num_queued_requests_gauge = queued_requests_gauge
+        self.num_queued_requests_gauge.set_default_tags(
+            {
+                "deployment": deployment_id.name,
+                "application": deployment_id.app_name,
+                "handle": self._handle_id,
+                "actor_id": self._self_actor_id,
+            }
         )
-        self._replicas_updated_event.set()
-        self.maybe_start_scheduling_tasks()
+        self.num_queued_requests_gauge.set(0)
 
-    def update_running_replicas(self, running_replicas: List[RunningReplicaInfo]):
-        """Shim for compatibility with the existing round robin scheduler."""
-        return self.update_replicas([ActorReplicaWrapper(r) for r in running_replicas])
+        # Track queries sent to replicas for the autoscaling algorithm.
+        self.num_requests_sent_to_replicas: DefaultDict[ReplicaID, int] = defaultdict(
+            int
+        )
+        self.num_running_requests_gauge = running_requests_gauge
+        self.num_running_requests_gauge.set_default_tags(
+            {
+                "deployment": deployment_id.name,
+                "application": deployment_id.app_name,
+                "handle": self._handle_id,
+                "actor_id": self._self_actor_id,
+            }
+        )
+        # We use Ray object ref callbacks to update state when tracking
+        # number of requests running on replicas. The callbacks will be
+        # called from a C++ thread into the router's async event loop,
+        # so non-atomic read and write operations need to be guarded by
+        # this thread-safe lock.
+        self._queries_lock = threading.Lock()
+        # Regularly aggregate and push autoscaling metrics to controller
+        self.metrics_pusher = MetricsPusher()
+        self.metrics_store = InMemoryMetricsStore()
+        # The config for the deployment this router sends requests to will be broadcast
+        # by the controller. That means it is not available until we get the first
+        # update. This includes an optional autoscaling config.
+        self._deployment_config: Optional[DeploymentConfig] = None
+        # Track whether the metrics manager has been shutdown
+        self._shutdown: bool = False
 
-    def _get_candidate_replica_ids(
-        self,
-        blacklist_replica_ids: Set[str],
-        request_metadata: Optional[RequestMetadata] = None,
-    ) -> Set[str]:
-        """Get candidates from the current replica set excluding the blacklist.
+        # Tracks in-flight metrics push to controller. Skip if new one is sent.
+        self._pending_metrics_push_ref: Optional[ObjectRef] = None
+        self._metrics_push_lock = threading.Lock()
 
-        If a model ID is present in request_metadata, any replicas that have it are
-        prioritized.
-        """
+        # If the interval is set to 0, eagerly sets all metrics.
+        self._cached_metrics_enabled = RAY_SERVE_METRICS_EXPORT_INTERVAL_MS != 0
+        self._cached_metrics_interval_s = RAY_SERVE_METRICS_EXPORT_INTERVAL_MS / 1000
+
+        if self._cached_metrics_enabled:
+            self._cached_num_router_requests = defaultdict(int)
+
+            def create_metrics_task():
+                event_loop.create_task(self._report_cached_metrics_forever())
+
+            # the constructor is called in the user thread, but its trying to create a task on the event loop
+            # which is running in the router thread. This is not thread safe, so we need to use call_soon_threadsafe
+            # to create the task on the event loop thread safely.
+            event_loop.call_soon_threadsafe(create_metrics_task)
+
+    @contextmanager
+    def wrap_request_assignment(self, request_meta: RequestMetadata):
+        max_queued_requests = (
+            self._deployment_config.max_queued_requests
+            if self._deployment_config is not None
+            else -1
+        )
         if (
-            request_metadata is not None
-            and request_metadata.multiplexed_model_id
-            in self._multiplexed_model_id_to_replica_ids
+            max_queued_requests != -1
+            and self.num_queued_requests >= max_queued_requests
         ):
-            candidates = self._multiplexed_model_id_to_replica_ids[
-                request_metadata.multiplexed_model_id
-            ].difference(blacklist_replica_ids)
-            if len(candidates) > 0:
-                return candidates
-
-        return self._replica_id_set.difference(blacklist_replica_ids)
-
-    async def choose_two_replicas_with_backoff(
-        self,
-        request_metadata: Optional[RequestMetadata] = None,
-    ) -> AsyncGenerator[List[RunningReplicaInfo], None]:
-        """Generator that repeatedly chooses two random replicas from `self._replicas`.
-
-        After each iteration, there will be an increasing backoff sleep time (dictated
-        by `self.backoff_sequence_s`). The caller should exit the generator to reset the
-        backoff sleep time.
-        """
-
-        backoff_index = 0
-        replica_ids_attempted = set()
-        while True:
-            # If no replicas are available, wait until `update_replicas` is called.
-            while len(self._replicas) == 0:
-                logger.info(
-                    "Tried to assign replica for deployment "
-                    f"{self._deployment_name} but none are available. "
-                    "Waiting for new replicas to be added.",
-                    extra={"log_to_stderr": False},
-                )
-                self._replicas_updated_event.clear()
-                await self._replicas_updated_event.wait()
-                logger.info(
-                    "Got replicas for deployment {self._deployment_name}, waking up.",
-                    extra={"log_to_stderr": False},
-                )
-
-            # Get candidates to sample from; this will exclude replicas used in a
-            # previous iteration until all replicas have been tried.
-            candidate_replica_ids = self._get_candidate_replica_ids(
-                replica_ids_attempted, request_metadata
+            # Due to the async nature of request handling, we may reject more requests
+            # than strictly necessary. This is more likely to happen during
+            # high concurrency. Here's why:
+            #
+            # When multiple requests arrive simultaneously with max_queued_requests=1:
+            # 1. First request increments num_queued_requests to 1
+            # 2. Before that request gets assigned to a replica and decrements the counter,
+            #    we yield to the event loop
+            # 3. Other requests see num_queued_requests=1 and get rejected, even though
+            #    the first request will soon free up the queue slot
+            #
+            # For example, with max_queued_requests=1 and 4 simultaneous requests:
+            # - Request 1 gets queued (num_queued_requests=1)
+            # - Requests 2,3,4 get rejected since queue appears full
+            # - Request 1 gets assigned and frees queue slot (num_queued_requests=0)
+            # - But we already rejected Request 2 which could have been queued
+            e = BackPressureError(
+                num_queued_requests=self.num_queued_requests,
+                max_queued_requests=max_queued_requests,
             )
-            chosen_ids = random.sample(
-                candidate_replica_ids, k=min(2, len(candidate_replica_ids))
-            )
-            yield [self._replicas[chosen_id] for chosen_id in chosen_ids]
+            logger.warning(e.message)
+            raise e
 
-            # If another iteration occurrs, the chosen replicas did not accept the
-            # request. Blacklist them until we've attempted all replicas.
-            replica_ids_attempted.update(chosen_ids)
-            if replica_ids_attempted.issuperset(self._replica_id_set):
-                replica_ids_attempted.clear()
+        self.inc_num_total_requests(request_meta.route)
+        yield
 
-            await asyncio.sleep(self.backoff_sequence_s[backoff_index])
-            backoff_index = min(backoff_index + 1, len(self.backoff_sequence_s) - 1)
-
-    async def select_from_candidate_replicas(
-        self, candidates: List[ReplicaWrapper]
-    ) -> Optional[ReplicaWrapper]:
-        """Chooses the best replica from the list of candidates.
-
-        If none of the replicas can be scheduled, returns `None`.
-
-        The queue length at each replica is queried directly from it. The time waited
-        for these queries is capped by `self.queue_len_response_deadline_s`; if a
-        replica doesn't respond within the deadline it is not considered.
-
-        Among replicas that respond within the deadline and accept the request (don't
-        have full queues), the one with the lowest queue length is chosen.
-        """
-        get_queue_state_tasks = []
-        for c in candidates:
-            t = self._loop.create_task(c.get_queue_state())
-            t.replica_id = c.replica_id
-            get_queue_state_tasks.append(t)
-
-        done, pending = await asyncio.wait(
-            get_queue_state_tasks,
-            timeout=self.queue_len_response_deadline_s,
-            return_when=asyncio.ALL_COMPLETED,
-        )
-        for task in pending:
-            task.cancel()
-
-        chosen_replica_id = None
-        lowest_queue_len = math.inf
-        for t in done:
-            if t.exception() is not None:
-                msg = (
-                    "Failed to fetch queue length for "
-                    f"replica {t.replica_id}: '{t.exception()}'"
-                )
-                # If we get a RayActorError, it means the replica actor has died. This
-                # is not recoverable (the controller will start a new replica in its
-                # place), so we should no longer consider it for requests.
-                if isinstance(t.exception(), RayActorError):
-                    self._replicas.pop(t.replica_id, None)
-                    self._replica_id_set.discard(t.replica_id)
-                    msg += " This replica will no longer be considered for requests."
-
-                logger.warning(msg)
-            else:
-                queue_len, accepted = t.result()
-                if accepted and queue_len < lowest_queue_len:
-                    chosen_replica_id = t.replica_id
-                    lowest_queue_len = queue_len
-
-        if chosen_replica_id is None:
-            return None
-
-        # `self._replicas` may have been updated since the candidates were chosen.
-        # In that case, return `None` so a new one is selected.
-        return self._replicas.get(chosen_replica_id, None)
-
-    def _get_pending_request_matching_metadata(
-        self,
-        replica: ReplicaWrapper,
-        request_metadata: Optional[RequestMetadata] = None,
-    ) -> Optional[PendingRequest]:
-        if request_metadata is None or not request_metadata.multiplexed_model_id:
-            return None
-
-        for pr in self._pending_requests_to_fulfill:
-            if (
-                not pr.future.done()
-                and pr.metadata.multiplexed_model_id
-                == request_metadata.multiplexed_model_id
+    @contextmanager
+    def wrap_queued_request(self, is_retry: bool, num_curr_replicas: int):
+        """Increment queued requests gauge and maybe push autoscaling metrics to controller."""
+        try:
+            self.inc_num_queued_requests()
+            # Optimization: if there are currently zero replicas for a deployment,
+            # push handle metric to controller to allow for fast cold start time.
+            # Only do this on the first attempt to route the request.
+            if not is_retry and self.should_send_scaled_to_zero_optimized_push(
+                curr_num_replicas=num_curr_replicas
             ):
-                return pr
+                self.push_autoscaling_metrics_to_controller()
 
-        return None
+            yield
+        finally:
+            # If the request is disconnected before assignment, this coroutine
+            # gets cancelled by the caller and an asyncio.CancelledError is
+            # raised. The finally block ensures that num_queued_requests
+            # is correctly decremented in this case.
+            self.dec_num_queued_requests()
 
-    def fulfill_next_pending_request(
-        self,
-        replica: ReplicaWrapper,
-        request_metadata: Optional[RequestMetadata] = None,
-    ):
-        """Assign the replica to the next pending request in FIFO order.
+    def _update_running_replicas(self, running_replicas: List[RunningReplicaInfo]):
+        """Prune list of replica ids in self.num_queries_sent_to_replicas.
 
-        If a pending request has been cancelled, it will be popped from the queue
-        and not assigned.
+        We want to avoid self.num_queries_sent_to_replicas from growing
+        in memory as the deployment upscales and downscales over time.
         """
-        # First try to match a pending request based on the request metadata (currently
-        # this only looks at the multiplexed model ID).
-        matched_pending_request = self._get_pending_request_matching_metadata(
-            replica, request_metadata
-        )
-        if matched_pending_request is not None:
-            matched_pending_request.future.set_result(replica)
-            self._pending_requests_to_fulfill.remove(matched_pending_request)
+
+        running_replica_set = {replica.replica_id for replica in running_replicas}
+        with self._queries_lock:
+            self.num_requests_sent_to_replicas = defaultdict(
+                int,
+                {
+                    id: self.num_requests_sent_to_replicas[id]
+                    for id, num_queries in self.num_requests_sent_to_replicas.items()
+                    if num_queries or id in running_replica_set
+                },
+            )
+
+    @property
+    def autoscaling_config(self) -> Optional[AutoscalingConfig]:
+        if self._deployment_config is None:
+            return None
+
+        return self._deployment_config.autoscaling_config
+
+    def update_deployment_config(
+        self, deployment_config: DeploymentConfig, curr_num_replicas: int
+    ):
+        """Update the config for the deployment this router sends requests to."""
+
+        if self._shutdown:
             return
 
-        # If no pending request matches the request metadata, fulfill the next in the
-        # queue in FIFO order, passing over futures that have been cancelled.
-        while len(self._pending_requests_to_fulfill) > 0:
-            pr = self._pending_requests_to_fulfill.popleft()
-            if not pr.future.done():
-                pr.future.set_result(replica)
-                break
+        self._deployment_config = deployment_config
 
-    def _get_next_pending_request_metadata_to_schedule(
-        self,
-    ) -> Optional[RequestMetadata]:
-        while len(self._pending_requests_to_schedule) > 0:
-            pr = self._pending_requests_to_schedule.popleft()
-            if not pr.future.done():
-                return pr.metadata
+        # Start the metrics pusher if autoscaling is enabled.
+        autoscaling_config = self.autoscaling_config
+        if autoscaling_config:
+            self.metrics_pusher.start()
+            # Optimization for autoscaling cold start time. If there are
+            # currently 0 replicas for the deployment, and there is at
+            # least one queued request on this router, then immediately
+            # push handle metric to the controller.
+            if self.should_send_scaled_to_zero_optimized_push(curr_num_replicas):
+                self.push_autoscaling_metrics_to_controller()
 
-        return None
-
-    async def fulfill_pending_requests(self):
-        """Repeatedly tries to fulfill a pending request with an available replica.
-
-        This is expected to be run inside a task in self._scheduling tasks.
-
-        When a replica is found, this method will exit if the number of scheduling tasks
-        has exceeded the target number. Else it will loop again to schedule another
-        replica.
-        """
-        try:
-            while len(self._scheduling_tasks) <= self.target_num_scheduling_tasks:
-                request_metadata = self._get_next_pending_request_metadata_to_schedule()
-                async for candidates in self.choose_two_replicas_with_backoff(
-                    request_metadata
-                ):
-                    replica = await self.select_from_candidate_replicas(candidates)
-                    if replica is not None:
-                        self.fulfill_next_pending_request(replica, request_metadata)
-                        break
-
-        except Exception:
-            logger.exception("Unexpected error in fulfill_pending_requests.")
-        finally:
-            self._scheduling_tasks.remove(asyncio.current_task(loop=self._loop))
-
-    def maybe_start_scheduling_tasks(self):
-        """Start scheduling tasks to fulfill pending requests if necessary.
-
-        Starts tasks so that there is at least one task per pending request
-        (respecting the max number of scheduling tasks).
-
-        In the common case, this will start a single task when a new request comes
-        in for scheduling. However, in cases where the number of available replicas
-        is updated or a task exits unexpectedly, we may need to start multiple.
-        """
-        tasks_to_start = (
-            self.target_num_scheduling_tasks - self.curr_num_scheduling_tasks
-        )
-        for _ in range(tasks_to_start):
-            self._scheduling_tasks.add(
-                self._loop.create_task(self.fulfill_pending_requests())
+            # Record number of queued + ongoing requests at regular
+            # intervals into the in-memory metrics store
+            record_interval_s = (
+                autoscaling_config.look_back_period_s
+                * RAY_SERVE_AUTOSCALING_METRIC_RECORD_INTERVAL_FACTOR
+            )
+            self.metrics_pusher.register_or_update_task(
+                self.RECORD_METRICS_TASK_NAME,
+                self._add_autoscaling_metrics_point,
+                min(record_interval_s, autoscaling_config.metrics_interval_s),
+            )
+            # Push metrics to the controller periodically.
+            self.metrics_pusher.register_or_update_task(
+                self.PUSH_METRICS_TO_CONTROLLER_TASK_NAME,
+                self.push_autoscaling_metrics_to_controller,
+                autoscaling_config.metrics_interval_s,
             )
 
-    async def choose_replica_for_query(self, query: Query) -> ReplicaWrapper:
-        """Chooses a replica to send the provided request to.
-
-        Requests are scheduled in FIFO order, so this puts a future on the internal
-        queue that will be resolved when a replica is available and it's the front of
-        the queue.
-
-        Upon cancellation (by the caller), the future is cancelled and will be passed
-        over when a replica becomes available.
-        """
-        pending_request = PendingRequest(asyncio.Future(), query.metadata)
-        try:
-            self._pending_requests_to_fulfill.append(pending_request)
-            self._pending_requests_to_schedule.append(pending_request)
-            self.maybe_start_scheduling_tasks()
-            replica = await pending_request.future
-        except asyncio.CancelledError as e:
-            pending_request.future.cancel()
-
-            raise e from None
-
-        return replica
-
-    async def assign_replica(
-        self, query: Query
-    ) -> Union[ray.ObjectRef, "ray._raylet.StreamingObjectRefGenerator"]:
-        """Choose a replica for the request and send it.
-
-        This will block indefinitely if no replicas are available to handle the
-        request, so it's up to the caller to time out or cancel the request.
-        """
-        replica = await self.choose_replica_for_query(query)
-        return replica.send_query(query)
-
-
-class RoundRobinReplicaScheduler(ReplicaScheduler):
-    """Round-robins requests across a set of actor replicas.
-
-    The policy respects `max_concurrent_queries` for the replicas: a replica
-    is not chosen if `max_concurrent_queries` requests are already outstanding.
-
-    This is maintained using a "tracker" object ref to determine when a given request
-    has finished (to decrement the number of concurrent queries).
-    """
-
-    def __init__(self, event_loop: asyncio.AbstractEventLoop):
-        self.in_flight_queries: Dict[RunningReplicaInfo, set] = dict()
-
-        # The iterator used for load balancing among replicas. Using itertools
-        # cycle, we implements a round-robin policy, skipping overloaded
-        # replicas.
-        # NOTE(simon): We can make this more pluggable and consider different
-        # policies like: min load, pick min of two replicas, pick replicas on
-        # the same node.
-        self.replica_iterator = itertools.cycle(self.in_flight_queries.keys())
-
-        # Used to unblock this replica set waiting for free replicas. A newly
-        # added replica or updated max_concurrent_queries value means the
-        # query that waits on a free replica might be unblocked on.
-        self.config_updated_event = make_asyncio_event_version_compat(event_loop)
-
-        # A map from multiplexed model id to a list of replicas that have the
-        # model loaded.
-        self.multiplexed_replicas_table: Dict[
-            str, List[RunningReplicaInfo]
-        ] = defaultdict(list)
-
-    def _reset_replica_iterator(self):
-        """Reset the iterator used to load balance replicas.
-
-        This call is expected to be called after the replica membership has
-        been updated. It will shuffle the replicas randomly to avoid multiple
-        handle sending requests in the same order.
-        """
-        replicas = list(self.in_flight_queries.keys())
-        random.shuffle(replicas)
-        self.replica_iterator = itertools.cycle(replicas)
-
-        # Update the multiplexed_replicas_table
-        new_multiplexed_replicas_table = defaultdict(list)
-        for replica in replicas:
-            for model_id in replica.multiplexed_model_ids:
-                new_multiplexed_replicas_table[model_id].append(replica)
-        self.multiplexed_replicas_table = new_multiplexed_replicas_table
-
-    def update_running_replicas(self, running_replicas: List[RunningReplicaInfo]):
-        added, removed, _ = compute_iterable_delta(
-            self.in_flight_queries.keys(), running_replicas
-        )
-
-        for new_replica in added:
-            self.in_flight_queries[new_replica] = set()
-
-        for removed_replica in removed:
-            # Delete it directly because shutdown is processed by controller.
-            # Replicas might already been deleted due to early detection of
-            # actor error.
-            self.in_flight_queries.pop(removed_replica, None)
-
-        if len(added) > 0 or len(removed) > 0:
-            logger.debug(f"ReplicaSet: +{len(added)}, -{len(removed)} replicas.")
-            self._reset_replica_iterator()
-            self.config_updated_event.set()
-
-    def _assign_replica(self, query: Query, replica: RunningReplicaInfo):
-        """Assign query to the replica.
-        Args:
-            query: Query object, containing the request metadata and args.
-            replica: Replica object, containing the actor handle to the replica.
-        Returns: object ref of the requests.
-        """
-
-        logger.debug(
-            f"Assigned query {query.metadata.request_id} "
-            f"to replica {replica.replica_tag}."
-        )
-        if replica.is_cross_language:
-            # Handling requests for Java replica
-            arg = query.args[0]
-            if query.metadata.is_http_request:
-                assert isinstance(arg, bytes)
-                loaded_http_input = pickle.loads(arg)
-                query_string = loaded_http_input.scope.get("query_string")
-                if query_string:
-                    arg = query_string.decode().split("=", 1)[1]
-                elif loaded_http_input.body:
-                    arg = loaded_http_input.body.decode()
-            user_ref = JavaActorHandleProxy(replica.actor_handle).handle_request.remote(
-                RequestMetadataProto(
-                    request_id=query.metadata.request_id,
-                    endpoint=query.metadata.endpoint,
-                    call_method=query.metadata.call_method
-                    if query.metadata.call_method != "__call__"
-                    else "call",
-                ).SerializeToString(),
-                [arg],
-            )
-            self.in_flight_queries[replica].add(user_ref)
         else:
-            # Directly passing args because it might contain an ObjectRef.
-            tracker_ref, user_ref = replica.actor_handle.handle_request.remote(
-                pickle.dumps(query.metadata), *query.args, **query.kwargs
-            )
-            self.in_flight_queries[replica].add(tracker_ref)
-        return user_ref
+            if self.metrics_pusher:
+                self.metrics_pusher.stop_tasks()
 
-    def _try_assign_replica(self, query: Query) -> Optional[ray.ObjectRef]:
-        """Try to assign query to a replica, return the object ref if succeeded
-        or return None if it can't assign this query to any replicas.
+    def _report_cached_metrics(self):
+        for route, count in self._cached_num_router_requests.items():
+            self.num_router_requests.inc(count, tags={"route": route})
+        self._cached_num_router_requests.clear()
+
+        self.num_queued_requests_gauge.set(self.num_queued_requests)
+
+        self.num_running_requests_gauge.set(
+            sum(self.num_requests_sent_to_replicas.values())
+        )
+
+    async def _report_cached_metrics_forever(self):
+        assert self._cached_metrics_interval_s > 0
+
+        consecutive_errors = 0
+        while True:
+            try:
+                await asyncio.sleep(self._cached_metrics_interval_s)
+                self._report_cached_metrics()
+                consecutive_errors = 0
+            except Exception:
+                logger.exception("Unexpected error reporting metrics.")
+
+                # Exponential backoff starting at 1s and capping at 10s.
+                backoff_time_s = min(10, 2**consecutive_errors)
+                consecutive_errors += 1
+                await asyncio.sleep(backoff_time_s)
+
+    def inc_num_total_requests(self, route: str):
+        if self._cached_metrics_enabled:
+            self._cached_num_router_requests[route] += 1
+        else:
+            self.num_router_requests.inc(tags={"route": route})
+
+    def inc_num_queued_requests(self):
+        self.num_queued_requests += 1
+        if not self._cached_metrics_enabled:
+            self.num_queued_requests_gauge.set(self.num_queued_requests)
+
+    def dec_num_queued_requests(self):
+        self.num_queued_requests -= 1
+        if not self._cached_metrics_enabled:
+            self.num_queued_requests_gauge.set(self.num_queued_requests)
+
+    def inc_num_running_requests_for_replica(self, replica_id: ReplicaID):
+        with self._queries_lock:
+            self.num_requests_sent_to_replicas[replica_id] += 1
+            if not self._cached_metrics_enabled:
+                self.num_running_requests_gauge.set(
+                    sum(self.num_requests_sent_to_replicas.values())
+                )
+
+    def dec_num_running_requests_for_replica(self, replica_id: ReplicaID):
+        with self._queries_lock:
+            self.num_requests_sent_to_replicas[replica_id] -= 1
+            if not self._cached_metrics_enabled:
+                self.num_running_requests_gauge.set(
+                    sum(self.num_requests_sent_to_replicas.values())
+                )
+
+    def should_send_scaled_to_zero_optimized_push(self, curr_num_replicas: int) -> bool:
+        return (
+            self.autoscaling_config is not None
+            and curr_num_replicas == 0
+            and self.num_queued_requests > 0
+        )
+
+    def push_autoscaling_metrics_to_controller(self):
+        """Pushes queued and running request metrics to the controller.
+
+        These metrics are used by the controller for autoscaling.
+        If a previous push is already in flight, skips this push (will try again next interval).
+        """
+        with self._metrics_push_lock:
+            if self._pending_metrics_push_ref is not None:
+                if not check_obj_ref_ready_nowait(self._pending_metrics_push_ref):
+                    return  # Previous push still in flight, skip and try again later
+            self._pending_metrics_push_ref = (
+                self._controller_handle.record_autoscaling_metrics_from_handle.remote(
+                    compress_metric_report(self._get_metrics_report())
+                )
+            )
+
+    def _add_autoscaling_metrics_point(self):
+        """Adds metrics point for queued and running requests at replicas.
+
+        Also prunes keys in the in memory metrics store with outdated datapoints.
+
+        ┌─────────────────────────────────────────────────────────────────┐
+        │  Handle-based metrics collection                                │
+        ├─────────────────────────────────────────────────────────────────┤
+        │                                                                 │
+        │  Client                Handle              Replicas             │
+        │  ┌──────┐            ┌────────┐          ┌─────────┐           │
+        │  │  App │───────────>│ Handle │─────────>│ Replica │           │
+        │  │      │  Requests  │        │ Forwards │    1    │           │
+        │  └──────┘            │ Tracks │          └─────────┘           │
+        │                      │ Queued │                                │
+        │                      │   +    │          ┌─────────┐           │
+        │                      │Running │─────────>│ Replica │           │
+        │                      │Requests│ Forwards │    2    │           │
+        │                      └────────┘          └─────────┘           │
+        │                          │                                      │
+        │                          │ Push metrics                         │
+        │                          └─────────────────> Controller         │
+        │                                                                 │
+        └─────────────────────────────────────────────────────────────────┘
+
+        :::{note}
+        The long-term plan is to deprecate handle-based metrics collection in favor of
+        replica-based collection. Replica-based collection will become the default in a
+        future release. Queued requests will be continues to be tracked at the handle.
+        :::
         """
 
-        # Try to find a replica that can handle this query
-        # If multiplexed model id is not specified, we can assign the query to
-        # any non-overloaded replica.
-        # If multiplexed model id is specified, we can try to assign the query
-        # to a replica that has the specified model loaded and
-        # is not overloaded with requests.
-        # If no such replica exists, we can assign the query to any non-overloaded
-        # replica.
-        if (
-            query.metadata.multiplexed_model_id
-            and query.metadata.multiplexed_model_id in self.multiplexed_replicas_table
-        ):
-            # Try to find the replica that is already handling the model.
-            for replica in self.multiplexed_replicas_table[
-                query.metadata.multiplexed_model_id
-            ]:
-                if (
-                    len(self.in_flight_queries[replica])
-                    >= replica.max_concurrent_queries
-                ):
-                    # This replica is overloaded, try next one
-                    continue
-                logger.debug(
-                    f"Assigned query {query.metadata.request_id} "
-                    f"to replica {replica.replica_tag}."
-                )
-                return self._assign_replica(query, replica)
-
-        for _ in range(len(self.in_flight_queries.keys())):
-            replica = next(self.replica_iterator)
-            if len(self.in_flight_queries[replica]) >= replica.max_concurrent_queries:
-                # This replica is overloaded, try next one
-                continue
-
-            if query.metadata.multiplexed_model_id:
-                # This query has a multiplexed model id, but the model is not
-                # loaded on this replica. Save this replica for future queries
-                # with the same model id.
-                self.multiplexed_replicas_table[
-                    query.metadata.multiplexed_model_id
-                ].append(replica)
-
-            logger.debug(
-                f"Assigned query {query.metadata.request_id} "
-                f"to replica {replica.replica_tag}."
+        timestamp = time.time()
+        self.metrics_store.add_metrics_point(
+            {QUEUED_REQUESTS_KEY: self.num_queued_requests}, timestamp
+        )
+        if RAY_SERVE_COLLECT_AUTOSCALING_METRICS_ON_HANDLE:
+            self.metrics_store.add_metrics_point(
+                self.num_requests_sent_to_replicas, timestamp
             )
-            return self._assign_replica(query, replica)
-        return None
 
-    @property
-    def _all_query_refs(self):
-        return list(itertools.chain.from_iterable(self.in_flight_queries.values()))
+        # Prevent in memory metrics store memory from growing
+        start_timestamp = time.time() - self.autoscaling_config.look_back_period_s
+        self.metrics_store.prune_keys_and_compact_data(start_timestamp)
 
-    def _drain_completed_object_refs(self) -> int:
-        refs = self._all_query_refs
-        # NOTE(simon): even though the timeout is 0, a large number of refs can still
-        # cause some blocking delay in the event loop. Consider moving this to async?
-        done, _ = ray.wait(refs, num_returns=len(refs), timeout=0)
-        replicas_to_remove = []
-        for replica_info, replica_in_flight_queries in self.in_flight_queries.items():
-            completed_queries = replica_in_flight_queries.intersection(done)
-            if len(completed_queries):
-                try:
-                    # NOTE(simon): this ray.get call should be cheap because all these
-                    # refs are ready as indicated by previous `ray.wait` call.
-                    ray.get(list(completed_queries))
-                except RayActorError:
-                    logger.debug(
-                        f"Removing {replica_info.replica_tag} from replica set "
-                        "because the actor exited."
-                    )
-                    replicas_to_remove.append(replica_info)
-                except RayTaskError:
-                    # Ignore application error.
-                    pass
-                except Exception:
-                    logger.exception(
-                        "Handle received unexpected error when processing request."
-                    )
-
-                replica_in_flight_queries.difference_update(completed_queries)
-
-        if len(replicas_to_remove) > 0:
-            for replica_info in replicas_to_remove:
-                self.in_flight_queries.pop(replica_info, None)
-            self._reset_replica_iterator()
-
-        return len(done)
-
-    async def assign_replica(self, query: Query) -> ray.ObjectRef:
-        """Given a query, submit it to a replica and return the object ref.
-        This method will keep track of the in flight queries for each replicas
-        and only send a query to available replicas (determined by the
-        max_concurrent_quries value.)
-        """
-        if query.metadata.is_streaming:
-            raise NotImplementedError("Streaming requires new routing to be enabled.")
-
-        assigned_ref = self._try_assign_replica(query)
-        while assigned_ref is None:  # Can't assign a replica right now.
-            logger.debug(
-                f"Failed to assign a replica for query {query.metadata.request_id}"
-            )
-            # Maybe there exists a free replica, we just need to refresh our
-            # query tracker.
-            num_finished = self._drain_completed_object_refs()
-            # All replicas are really busy, wait for a query to complete or the
-            # config to be updated.
-            if num_finished == 0:
-                logger.debug("All replicas are busy, waiting for a free replica.")
-                await asyncio.wait(
-                    self._all_query_refs + [self.config_updated_event.wait()],
-                    return_when=asyncio.FIRST_COMPLETED,
+    def _get_metrics_report(self) -> HandleMetricReport:
+        timestamp = time.time()
+        running_requests = dict()
+        avg_running_requests = dict()
+        look_back_period = self.autoscaling_config.look_back_period_s
+        self.metrics_store.prune_keys_and_compact_data(time.time() - look_back_period)
+        avg_queued_requests = self.metrics_store.aggregate_avg([QUEUED_REQUESTS_KEY])[0]
+        if avg_queued_requests is None:
+            # If the queued requests timeseries is empty, we set the
+            # average to the current number of queued requests.
+            avg_queued_requests = self.num_queued_requests
+        # If the queued requests timeseries is empty, we set the number of data points to 1.
+        # This is to avoid division by zero.
+        num_data_points = self.metrics_store.timeseries_count(QUEUED_REQUESTS_KEY) or 1
+        queued_requests = self.metrics_store.data.get(
+            QUEUED_REQUESTS_KEY, [TimeStampedValue(timestamp, self.num_queued_requests)]
+        )
+        if RAY_SERVE_COLLECT_AUTOSCALING_METRICS_ON_HANDLE and self.autoscaling_config:
+            for replica_id, num_requests in self.num_requests_sent_to_replicas.items():
+                # Calculate avg running requests.
+                # NOTE (abrar): The number of data points from queued requests is often higher than
+                # those from running requests. This is because replica metrics are only collected
+                # once a replica is up, whereas queued request metrics are collected continuously
+                # as long as the handle is alive. To approximate the true average of ongoing requests,
+                # we should normalize by using the same number of data points for both queued and
+                # running request time series.
+                running_requests_sum = self.metrics_store.aggregate_sum([replica_id])[0]
+                if running_requests_sum is None:
+                    # If the running requests timeseries is empty, we set the sum
+                    # to the current number of requests.
+                    running_requests_sum = num_requests
+                replica_str = replica_id.to_full_id_str()
+                avg_running_requests[replica_str] = (
+                    running_requests_sum / num_data_points
                 )
-                if self.config_updated_event.is_set():
-                    self.config_updated_event.clear()
-            # We are pretty sure a free replica is ready now, let's recurse and
-            # assign this query a replica.
-            assigned_ref = self._try_assign_replica(query)
+                # Get running requests data
+                running_requests[replica_str] = self.metrics_store.data.get(
+                    replica_id, [TimeStampedValue(timestamp, num_requests)]
+                )
+        handle_metric_report = HandleMetricReport(
+            deployment_id=self._deployment_id,
+            handle_id=self._handle_id,
+            actor_id=self._self_actor_id,
+            handle_source=self._handle_source,
+            aggregated_queued_requests=avg_queued_requests,
+            queued_requests=queued_requests,
+            aggregated_metrics={
+                RUNNING_REQUESTS_KEY: avg_running_requests,
+            },
+            metrics={
+                RUNNING_REQUESTS_KEY: running_requests,
+            },
+            timestamp=timestamp,
+        )
 
-        return assigned_ref
+        return handle_metric_report
+
+    async def shutdown(self):
+        """Shutdown metrics manager gracefully."""
+
+        if self.metrics_pusher:
+            await self.metrics_pusher.graceful_shutdown()
+
+        self._shutdown = True
 
 
-class Router:
+class Router(ABC):
+    @abstractmethod
+    def running_replicas_populated(self) -> bool:
+        pass
+
+    @abstractmethod
+    def assign_request(
+        self,
+        request_meta: RequestMetadata,
+        *request_args,
+        **request_kwargs,
+    ) -> concurrent.futures.Future[ReplicaResult]:
+        pass
+
+    @abstractmethod
+    def shutdown(self) -> concurrent.futures.Future:
+        pass
+
+
+async def create_event() -> asyncio.Event:
+    """Helper to create an asyncio event in the current event loop."""
+    return asyncio.Event()
+
+
+class AsyncioRouter:
     def __init__(
         self,
         controller_handle: ActorHandle,
-        deployment_name: str,
-        event_loop: asyncio.BaseEventLoop = None,
-        _use_new_routing: bool = False,
+        deployment_id: DeploymentID,
+        handle_id: str,
+        self_actor_id: str,
+        handle_source: DeploymentHandleSource,
+        event_loop: asyncio.BaseEventLoop,
+        enable_strict_max_ongoing_requests: bool,
+        node_id: str,
+        availability_zone: Optional[str],
+        prefer_local_node_routing: bool,
+        resolve_request_arg_func: Coroutine = resolve_deployment_response,
+        request_router_class: Optional[Callable] = None,
+        request_router_kwargs: Optional[Dict[str, Any]] = None,
+        request_router: Optional[RequestRouter] = None,
+        _request_router_initialized_event: Optional[asyncio.Event] = None,
     ):
         """Used to assign requests to downstream replicas for a deployment.
 
-        The scheduling behavior is delegated to a ReplicaScheduler; this is a thin
+        The routing behavior is delegated to a RequestRouter; this is a thin
         wrapper that adds metrics and logging.
         """
+        self._controller_handle = controller_handle
+        self.deployment_id = deployment_id
+        self._self_actor_id = self_actor_id
+        self._handle_source = handle_source
         self._event_loop = event_loop
-        if _use_new_routing:
-            self._replica_scheduler = PowerOfTwoChoicesReplicaScheduler(
-                event_loop, deployment_name
-            )
-            logger.info(
-                "Using PowerOfTwoChoicesReplicaScheduler.",
-                extra={"log_to_stderr": False},
-            )
+        self._request_router_class = request_router_class
+        self._request_router_kwargs = (
+            request_router_kwargs if request_router_kwargs else {}
+        )
+        self._enable_strict_max_ongoing_requests = enable_strict_max_ongoing_requests
+        self._node_id = node_id
+        self._availability_zone = availability_zone
+        self._prefer_local_node_routing = prefer_local_node_routing
+        # By default, deployment is available unless we receive news
+        # otherwise through a long poll broadcast from the controller.
+        self._deployment_available = True
+
+        # The request router will be lazy loaded to decouple form the initialization.
+        self._request_router: Optional[RequestRouter] = request_router
+
+        if _request_router_initialized_event:
+            self._request_router_initialized = _request_router_initialized_event
         else:
-            self._replica_scheduler = RoundRobinReplicaScheduler(event_loop)
-            logger.info(
-                "Using RoundRobinReplicaScheduler.",
-                extra={"log_to_stderr": False},
-            )
+            future = asyncio.run_coroutine_threadsafe(create_event(), self._event_loop)
+            self._request_router_initialized = future.result()
 
-        # -- Metrics Registration -- #
-        self.num_router_requests = metrics.Counter(
-            "serve_num_router_requests",
-            description="The number of requests processed by the router.",
-            tag_keys=("deployment", "route", "application"),
-        )
-        self.num_router_requests.set_default_tags({"deployment": deployment_name})
+        if self._request_router:
+            self._request_router_initialized.set()
+        self._resolve_request_arg_func = resolve_request_arg_func
+        self._running_replicas: Optional[List[RunningReplicaInfo]] = None
 
-        self.num_queued_queries = 0
-        self.num_queued_queries_gauge = metrics.Gauge(
-            "serve_deployment_queued_queries",
-            description=(
-                "The current number of queries to this deployment waiting"
-                " to be assigned to a replica."
+        # Flipped to `True` once the router has received a non-empty
+        # replica set at least once.
+        self._running_replicas_populated: bool = False
+
+        # Initializing `self._metrics_manager` before `self.long_poll_client` is
+        # necessary to avoid race condition where `self.update_deployment_config()`
+        # might be called before `self._metrics_manager` instance is created.
+        self._metrics_manager = RouterMetricsManager(
+            deployment_id,
+            handle_id,
+            self_actor_id,
+            handle_source,
+            controller_handle,
+            metrics.Counter(
+                "serve_num_router_requests",
+                description="The number of requests processed by the router.",
+                tag_keys=("deployment", "route", "application", "handle", "actor_id"),
             ),
-            tag_keys=("deployment", "application"),
+            metrics.Gauge(
+                "serve_deployment_queued_queries",
+                description=(
+                    "The current number of queries to this deployment waiting"
+                    " to be assigned to a replica."
+                ),
+                tag_keys=("deployment", "application", "handle", "actor_id"),
+            ),
+            metrics.Gauge(
+                "serve_num_ongoing_requests_at_replicas",
+                description=(
+                    "The current number of requests to this deployment that "
+                    "have been submitted to a replica."
+                ),
+                tag_keys=("deployment", "application", "handle", "actor_id"),
+            ),
+            event_loop,
         )
-        self.num_queued_queries_gauge.set_default_tags({"deployment": deployment_name})
+
+        # The Router needs to stay informed about changes to the target deployment's
+        # running replicas and deployment config. We do this via the long poll system.
+        # However, for efficiency, we don't want to create a LongPollClient for every
+        # DeploymentHandle, so we use a shared LongPollClient that all Routers
+        # register themselves with. But first, the router needs to get a fast initial
+        # update so that it can start serving requests, which we do with a dedicated
+        # LongPollClient that stops running once the shared client takes over.
 
         self.long_poll_client = LongPollClient(
             controller_handle,
             {
                 (
-                    LongPollNamespace.RUNNING_REPLICAS,
-                    deployment_name,
-                ): self._replica_scheduler.update_running_replicas,
+                    LongPollNamespace.DEPLOYMENT_TARGETS,
+                    deployment_id,
+                ): self.update_deployment_targets,
+                (
+                    LongPollNamespace.DEPLOYMENT_CONFIG,
+                    deployment_id,
+                ): self.update_deployment_config,
             },
-            call_in_event_loop=event_loop,
+            call_in_event_loop=self._event_loop,
         )
 
-        # Start the metrics pusher if autoscaling is enabled.
-        self.deployment_name = deployment_name
-        deployment_route = DeploymentRoute.FromString(
-            ray.get(controller_handle.get_deployment_info.remote(self.deployment_name))
+        shared = SharedRouterLongPollClient.get_or_create(
+            controller_handle, self._event_loop
         )
-        deployment_info = DeploymentInfo.from_proto(deployment_route.deployment_info)
-        if deployment_info.deployment_config.autoscaling_config:
-            self.metrics_pusher = MetricsPusher()
-            self.metrics_pusher.register_task(
-                self._collect_handle_queue_metrics,
-                HANDLE_METRIC_PUSH_INTERVAL_S,
-                controller_handle.record_handle_metrics.remote,
+        shared.register(self)
+
+    @property
+    def request_router(self) -> Optional[RequestRouter]:
+        """Get and lazy loading request router.
+
+        If the request_router_class not provided, and the request router is not
+        yet initialized, then it will return None. Otherwise, if request router
+        is not yet initialized, it will be initialized and returned. Also,
+        setting `self._request_router_initialized` to signal that the request
+        router is initialized.
+        """
+        if not self._request_router and self._request_router_class:
+            request_router = self._request_router_class(
+                deployment_id=self.deployment_id,
+                handle_source=self._handle_source,
+                self_node_id=self._node_id,
+                self_actor_id=self._self_actor_id,
+                self_actor_handle=ray.get_runtime_context().current_actor
+                if ray.get_runtime_context().get_actor_id()
+                else None,
+                # Streaming ObjectRefGenerators are not supported in Ray Client
+                use_replica_queue_len_cache=self._enable_strict_max_ongoing_requests,
+                create_replica_wrapper_func=lambda r: RunningReplica(r),
+                prefer_local_node_routing=self._prefer_local_node_routing,
+                prefer_local_az_routing=RAY_SERVE_PROXY_PREFER_LOCAL_AZ_ROUTING,
+                self_availability_zone=self._availability_zone,
+            )
+            request_router.initialize_state(**(self._request_router_kwargs))
+
+            # Populate the running replicas if they are already available.
+            if self._running_replicas is not None:
+                request_router._update_running_replicas(self._running_replicas)
+
+            self._request_router = request_router
+            self._request_router_initialized.set()
+
+            # Log usage telemetry to indicate that custom request router
+            # feature is being used in this cluster.
+            if (
+                self._request_router_class.__name__
+                != PowerOfTwoChoicesRequestRouter.__name__
+            ):
+                ServeUsageTag.CUSTOM_REQUEST_ROUTER_USED.record("1")
+        return self._request_router
+
+    def running_replicas_populated(self) -> bool:
+        return self._running_replicas_populated
+
+    def update_deployment_targets(self, deployment_target_info: DeploymentTargetInfo):
+        self._deployment_available = deployment_target_info.is_available
+
+        running_replicas = deployment_target_info.running_replicas
+        if self.request_router:
+            self.request_router._update_running_replicas(running_replicas)
+        else:
+            # In this case, the request router hasn't been initialized yet.
+            # Store the running replicas so that we can update the request
+            # router once it is initialized.
+            self._running_replicas = running_replicas
+        self._metrics_manager._update_running_replicas(running_replicas)
+
+        if running_replicas:
+            self._running_replicas_populated = True
+
+    def update_deployment_config(self, deployment_config: DeploymentConfig):
+        self._request_router_class = (
+            deployment_config.request_router_config.get_request_router_class()
+        )
+        self._request_router_kwargs = (
+            deployment_config.request_router_config.request_router_kwargs
+        )
+        self._metrics_manager.update_deployment_config(
+            deployment_config,
+            curr_num_replicas=len(self.request_router.curr_replicas),
+        )
+
+    async def _resolve_request_arguments(
+        self,
+        pr: PendingRequest,
+    ) -> None:
+        """Asynchronously resolve and replace top-level request args and kwargs."""
+        if pr.resolved:
+            return
+
+        new_args = list(pr.args)
+        new_kwargs = pr.kwargs.copy()
+
+        # Map from index -> task for resolving positional arg
+        resolve_arg_tasks = {}
+        for i, obj in enumerate(pr.args):
+            task = await self._resolve_request_arg_func(obj, pr.metadata)
+            if task is not None:
+                resolve_arg_tasks[i] = task
+
+        # Map from key -> task for resolving key-word arg
+        resolve_kwarg_tasks = {}
+        for k, obj in pr.kwargs.items():
+            task = await self._resolve_request_arg_func(obj, pr.metadata)
+            if task is not None:
+                resolve_kwarg_tasks[k] = task
+
+        # Gather all argument resolution tasks concurrently.
+        if resolve_arg_tasks or resolve_kwarg_tasks:
+            all_tasks = list(resolve_arg_tasks.values()) + list(
+                resolve_kwarg_tasks.values()
+            )
+            await asyncio.wait(all_tasks)
+
+        # Update new args and new kwargs with resolved arguments
+        for index, task in resolve_arg_tasks.items():
+            new_args[index] = task.result()
+        for key, task in resolve_kwarg_tasks.items():
+            new_kwargs[key] = task.result()
+
+        pr.args = new_args
+        pr.kwargs = new_kwargs
+        pr.resolved = True
+
+    def _process_finished_request(
+        self,
+        replica_id: ReplicaID,
+        internal_request_id: str,
+        result: Union[Any, RayError],
+    ) -> None:
+        if RAY_SERVE_COLLECT_AUTOSCALING_METRICS_ON_HANDLE:
+            self._metrics_manager.dec_num_running_requests_for_replica(replica_id)
+
+        # Notify request router that request completed (for cleanup, e.g., token release)
+        if self.request_router:
+            self.request_router.on_request_completed(replica_id, internal_request_id)
+
+        if isinstance(result, ActorDiedError):
+            # Replica has died but controller hasn't notified the router yet.
+            # Don't consider this replica for requests in the future, and retry
+            # routing request.
+            if self.request_router:
+                self.request_router.on_replica_actor_died(replica_id)
+            logger.warning(
+                f"{replica_id} will not be considered for future "
+                "requests because it has died."
+            )
+        elif isinstance(result, ActorUnavailableError):
+            # There are network issues, or replica has died but GCS is down so
+            # ActorUnavailableError will be raised until GCS recovers. For the
+            # time being, invalidate the cache entry so that we don't try to
+            # send requests to this replica without actively probing, and retry
+            # routing request.
+            if self.request_router:
+                self.request_router.on_replica_actor_unavailable(replica_id)
+            logger.warning(
+                f"Request failed because {replica_id} is temporarily unavailable."
             )
 
-            self.metrics_pusher.start()
+    async def _route_and_send_request_once(
+        self,
+        pr: PendingRequest,
+        response_id: str,
+        is_retry: bool,
+    ) -> Optional[ReplicaResult]:
+        result: Optional[ReplicaResult] = None
+        replica: Optional[RunningReplica] = None
+        callback_registered = False
+        try:
+            # Resolve request arguments BEFORE incrementing queued requests.
+            # This ensures that queue metrics reflect actual pending work,
+            # not time spent waiting for upstream DeploymentResponse arguments.
+            # See: https://github.com/ray-project/ray/issues/60624
+            if not pr.resolved:
+                await self._resolve_request_arguments(pr)
 
-    def _collect_handle_queue_metrics(self) -> Dict[str, int]:
-        return {self.deployment_name: self.num_queued_queries}
+            num_curr_replicas = len(self.request_router.curr_replicas)
+            with self._metrics_manager.wrap_queued_request(is_retry, num_curr_replicas):
+                replica = await self.request_router._choose_replica_for_request(
+                    pr, is_retry=is_retry
+                )
 
+                # If the queue len cache is disabled or we're sending a request to Java,
+                # then directly send the query and hand the response back. The replica will
+                # never reject requests in this code path.
+                with_rejection = (
+                    self._enable_strict_max_ongoing_requests
+                    and not replica.is_cross_language
+                )
+                result = replica.try_send_request(pr, with_rejection=with_rejection)
+
+                # Proactively update the queue length cache.
+                self.request_router.on_send_request(replica.replica_id)
+
+            # Keep track of requests that have been sent out to replicas
+            if RAY_SERVE_COLLECT_AUTOSCALING_METRICS_ON_HANDLE:
+                self._metrics_manager.inc_num_running_requests_for_replica(
+                    replica.replica_id
+                )
+            # Always register callback to notify router when request completes
+            # (needed for token release in queue-based routing, metrics tracking, etc.)
+            callback = partial(
+                self._process_finished_request,
+                replica.replica_id,
+                pr.metadata.internal_request_id,
+            )
+            result.add_done_callback(callback)
+            callback_registered = True
+
+            if not with_rejection:
+                return result
+
+            queue_info = await result.get_rejection_response()
+            self.request_router.on_new_queue_len_info(replica.replica_id, queue_info)
+            if queue_info.accepted:
+                self.request_router.on_request_routed(pr, replica.replica_id, result)
+                return result
+
+        except asyncio.CancelledError:
+            # NOTE(edoakes): this is not strictly necessary because there are
+            # currently no `await` statements between getting the ref and returning,
+            # but I'm adding it defensively.
+            if result is not None:
+                result.cancel()
+
+            raise
+        except ActorDiedError:
+            # Replica has died but controller hasn't notified the router yet.
+            # Don't consider this replica for requests in the future, and retry
+            # routing request.
+            if replica is not None:
+                self.request_router.on_replica_actor_died(replica.replica_id)
+                logger.warning(
+                    f"{replica.replica_id} will not be considered for future "
+                    "requests because it has died."
+                )
+        except ActorUnavailableError:
+            # There are network issues, or replica has died but GCS is down so
+            # ActorUnavailableError will be raised until GCS recovers. For the
+            # time being, invalidate the cache entry so that we don't try to
+            # send requests to this replica without actively probing, and retry
+            # routing request.
+            if replica is not None:
+                self.request_router.on_replica_actor_unavailable(replica.replica_id)
+                logger.warning(f"{replica.replica_id} is temporarily unavailable.")
+        finally:
+            # Only release if callback wasn't registered (callback handles release).
+            if replica is not None and not callback_registered:
+                self.request_router.on_request_completed(
+                    replica.replica_id, pr.metadata.internal_request_id
+                )
+
+        return None
+
+    async def route_and_send_request(
+        self,
+        pr: PendingRequest,
+        response_id: str,
+    ) -> ReplicaResult:
+        """Choose a replica for the request and send it.
+
+        This will block indefinitely if no replicas are available to handle the
+        request, so it's up to the caller to time out or cancel the request.
+        """
+        # Wait for the router to be initialized before sending the request.
+        await self._request_router_initialized.wait()
+
+        is_retry = False
+        while True:
+            result = await self._route_and_send_request_once(
+                pr,
+                response_id,
+                is_retry,
+            )
+            if result is not None:
+                return result
+
+            # If the replica rejects the request, retry the routing process. The
+            # request will be placed on the front of the queue to avoid tail latencies.
+            # TODO(edoakes): this retry procedure is not perfect because it'll reset the
+            # process of choosing candidates replicas (i.e., for locality-awareness).
+            is_retry = True
+
+    @tracing_decorator_factory(
+        trace_name="route_to_replica",
+    )
     async def assign_request(
         self,
         request_meta: RequestMetadata,
         *request_args,
         **request_kwargs,
-    ) -> Union[ray.ObjectRef, "ray._raylet.StreamingObjectRefGenerator"]:
-        """Assign a query to a replica and return the resulting object_ref."""
+    ) -> ReplicaResult:
+        """Assign a request to a replica and return the resulting object_ref."""
+        if is_span_recording():
+            trace_attributes = {
+                "request_id": request_meta.request_id,
+                "deployment": self.deployment_id.name,
+                "app": self.deployment_id.app_name,
+                "call_method": request_meta.call_method,
+                "route": request_meta.route,
+                "multiplexed_model_id": request_meta.multiplexed_model_id,
+                "is_streaming": request_meta.is_streaming,
+                "is_http_request": request_meta.is_http_request,
+                "is_grpc_request": request_meta.is_grpc_request,
+            }
+            set_span_attributes(trace_attributes)
+            set_span_name(
+                f"route_to_replica {self.deployment_id.name} {request_meta.call_method}"
+            )
+            # Add context to request meta to link
+            # traces collected in the replica.
+            propagate_context = create_propagated_context()
+            request_meta.tracing_context = propagate_context
+        else:
+            request_meta.tracing_context = None
 
-        self.num_router_requests.inc(
-            tags={"route": request_meta.route, "application": request_meta.app_name}
+        if not self._deployment_available:
+            raise DeploymentUnavailableError(self.deployment_id)
+
+        response_id = generate_request_id()
+        assign_request_task = asyncio.current_task()
+        ray.serve.context._add_request_pending_assignment(
+            request_meta.internal_request_id, response_id, assign_request_task
         )
-        self.num_queued_queries += 1
-        self.num_queued_queries_gauge.set(
-            self.num_queued_queries,
-            tags={
-                "application": request_meta.app_name,
-            },
+        assign_request_task.add_done_callback(
+            lambda _: ray.serve.context._remove_request_pending_assignment(
+                request_meta.internal_request_id, response_id
+            )
         )
 
-        query = Query(
-            args=list(request_args),
-            kwargs=request_kwargs,
-            metadata=request_meta,
-        )
-        await query.resolve_async_tasks()
-        await query.buffer_starlette_requests_and_warn()
-        result = await self._replica_scheduler.assign_replica(query)
+        # Wait for the router to be initialized before sending the request.
+        await self._request_router_initialized.wait()
 
-        self.num_queued_queries -= 1
-        self.num_queued_queries_gauge.set(
-            self.num_queued_queries,
-            tags={
-                "application": request_meta.app_name,
-            },
+        with self._metrics_manager.wrap_request_assignment(request_meta):
+            replica_result = None
+            exc = None
+            try:
+                replica_result = await self.route_and_send_request(
+                    PendingRequest(
+                        args=list(request_args),
+                        kwargs=request_kwargs,
+                        metadata=request_meta,
+                    ),
+                    response_id,
+                )
+                return replica_result
+            except asyncio.CancelledError as e:
+                exc = e
+                # NOTE(edoakes): this is not strictly necessary because
+                # there are currently no `await` statements between
+                # getting the ref and returning, but I'm adding it defensively.
+                if replica_result is not None:
+                    replica_result.cancel()
+
+                raise
+            finally:
+                if is_span_recording():
+                    if request_meta.is_http_request:
+                        set_http_span_attributes(
+                            method=request_meta.call_method,
+                            route=request_meta.route,
+                        )
+                    else:
+                        set_rpc_span_attributes(
+                            system=request_meta._request_protocol,
+                            method=request_meta.call_method,
+                            service=self.deployment_id.name,
+                        )
+                    if exc:
+                        set_span_exception(exc, escaped=True)
+
+    async def shutdown(self):
+        await self._metrics_manager.shutdown()
+
+
+class SingletonThreadRouter(Router):
+    """Wrapper class that runs an AsyncioRouter on a separate thread.
+
+    The motivation for this is to avoid user code blocking the event loop and
+    preventing the router from making progress.
+
+    Maintains a singleton event loop running in a daemon thread that is shared by
+    all AsyncioRouters.
+    """
+
+    _asyncio_loop: Optional[asyncio.AbstractEventLoop] = None
+    _asyncio_loop_creation_lock = threading.Lock()
+    _event_loop_monitor: Optional[EventLoopMonitor] = None
+
+    def __init__(self, **passthrough_kwargs):
+        assert (
+            "event_loop" not in passthrough_kwargs
+        ), "SingletonThreadRouter manages the router event loop."
+
+        if passthrough_kwargs.get("handle_source") == DeploymentHandleSource.REPLICA:
+            component = EventLoopMonitor.COMPONENT_REPLICA
+        elif passthrough_kwargs.get("handle_source") == DeploymentHandleSource.PROXY:
+            component = EventLoopMonitor.COMPONENT_PROXY
+        else:
+            component = EventLoopMonitor.COMPONENT_UNKNOWN
+
+        self._asyncio_router = AsyncioRouter(
+            event_loop=self._get_singleton_asyncio_loop(component), **passthrough_kwargs
         )
 
-        return result
+    @classmethod
+    def _get_singleton_asyncio_loop(cls, component: str) -> asyncio.AbstractEventLoop:
+        """Get singleton asyncio loop running in a daemon thread.
+
+        This method is thread safe.
+        """
+        with cls._asyncio_loop_creation_lock:
+            if cls._asyncio_loop is None:
+                cls._asyncio_loop = asyncio.new_event_loop()
+
+                # Create event loop monitor for the router loop.
+                # This is shared across all replicas in this process.
+                actor_id = ray.get_runtime_context().get_actor_id()
+                cls._event_loop_monitor = EventLoopMonitor(
+                    component=component,
+                    loop_type=EventLoopMonitor.LOOP_TYPE_ROUTER,
+                    # actor_id is None when using DeploymentHandle.remote()
+                    # from the driver.
+                    actor_id=actor_id or "",
+                )
+
+                def _run_router_event_loop():
+                    asyncio.set_event_loop(cls._asyncio_loop)
+                    # Start monitoring before run_forever so the task is scheduled.
+                    cls._event_loop_monitor.start(cls._asyncio_loop)
+                    cls._asyncio_loop.run_forever()
+
+                thread = threading.Thread(
+                    daemon=True,
+                    target=_run_router_event_loop,
+                )
+                thread.start()
+
+        return cls._asyncio_loop
+
+    def running_replicas_populated(self) -> bool:
+        return self._asyncio_router.running_replicas_populated()
+
+    def assign_request(
+        self,
+        request_meta: RequestMetadata,
+        *request_args,
+        **request_kwargs,
+    ) -> concurrent.futures.Future[ReplicaResult]:
+        """Routes assign_request call on the internal asyncio loop.
+
+        This method uses `run_coroutine_threadsafe` to execute the actual request
+        assignment logic (`_asyncio_router.assign_request`) on the dedicated
+        asyncio event loop thread. It returns a `concurrent.futures.Future` that
+        can be awaited or queried from the calling thread.
+
+        Returns:
+            A concurrent.futures.Future resolving to the ReplicaResult representing
+            the assigned request.
+        """
+
+        def asyncio_future_callback(
+            asyncio_future: asyncio.Future, concurrent_future: concurrent.futures.Future
+        ):
+            """Callback attached to the asyncio Task running assign_request.
+
+            This runs when the asyncio Task finishes (completes, fails, or is cancelled).
+            Its primary goal is to propagate cancellation initiated via the
+            `concurrent_future` back to the `ReplicaResult` in situations where
+            asyncio_future didn't see the cancellation event in time. Think of it
+            like a second line of defense for cancellation of replica results.
+            """
+            # Check if the cancellation originated from the concurrent.futures.Future
+            if (
+                concurrent_future.cancelled()
+                and not asyncio_future.cancelled()
+                and asyncio_future.exception() is None
+            ):
+                result: ReplicaResult = asyncio_future.result()
+                logger.info(
+                    "Asyncio task completed despite cancellation attempt. "
+                    "Attempting to cancel the request that was assigned to a replica."
+                )
+                result.cancel()
+
+        concurrent_future = concurrent.futures.Future()
+
+        def create_task_and_setup():
+            task = self._asyncio_loop.create_task(
+                self._asyncio_router.assign_request(
+                    request_meta, *request_args, **request_kwargs
+                )
+            )
+
+            # Set up your cancellation callback
+            task.add_done_callback(
+                lambda _: asyncio_future_callback(_, concurrent_future)
+            )
+
+            try:
+                # chain the two futures to handle direction channel of cancellation
+                futures._chain_future(
+                    ensure_future(task, loop=self._asyncio_loop), concurrent_future
+                )
+            except (SystemExit, KeyboardInterrupt):
+                raise
+            except BaseException as exc:
+                if concurrent_future.set_running_or_notify_cancel():
+                    concurrent_future.set_exception(exc)
+                raise
+
+        # Schedule on the event loop thread
+        self._asyncio_loop.call_soon_threadsafe(create_task_and_setup)
+        return concurrent_future
+
+    def shutdown(self) -> concurrent.futures.Future:
+        return asyncio.run_coroutine_threadsafe(
+            self._asyncio_router.shutdown(), loop=self._asyncio_loop
+        )
+
+
+class SharedRouterLongPollClient:
+    def __init__(self, controller_handle: ActorHandle, event_loop: AbstractEventLoop):
+        self.controller_handler = controller_handle
+        self.event_loop = event_loop
+
+        # We use a WeakSet to store the Routers so that we don't prevent them
+        # from being garbage-collected.
+        self.routers: MutableMapping[
+            DeploymentID, weakref.WeakSet[AsyncioRouter]
+        ] = defaultdict(weakref.WeakSet)
+
+        # Creating the LongPollClient implicitly starts it
+        self.long_poll_client = LongPollClient(
+            controller_handle,
+            key_listeners={},
+            call_in_event_loop=self.event_loop,
+        )
+
+    @classmethod
+    @lru_cache(maxsize=None)
+    def get_or_create(
+        cls, controller_handle: ActorHandle, event_loop: AbstractEventLoop
+    ) -> "SharedRouterLongPollClient":
+        shared = cls(controller_handle=controller_handle, event_loop=event_loop)
+        logger.info(f"Started {shared}.")
+        return shared
+
+    def update_deployment_targets(
+        self,
+        deployment_target_info: DeploymentTargetInfo,
+        deployment_id: DeploymentID,
+    ) -> None:
+        for router in self.routers[deployment_id]:
+            router.update_deployment_targets(deployment_target_info)
+            router.long_poll_client.stop()
+
+    def update_deployment_config(
+        self, deployment_config: DeploymentConfig, deployment_id: DeploymentID
+    ) -> None:
+        for router in self.routers[deployment_id]:
+            router.update_deployment_config(deployment_config)
+            router.long_poll_client.stop()
+
+    def register(self, router: AsyncioRouter) -> None:
+        # We need to run the underlying method in the same event loop that runs
+        # the long poll loop, because we need to mutate the mapping of routers,
+        # which are also being iterated over by the key listener callbacks.
+        # If those happened concurrently in different threads,
+        # we could get a `RuntimeError: Set changed size during iteration`.
+        # See https://github.com/ray-project/ray/pull/53613 for more details.
+        self.event_loop.call_soon_threadsafe(self._register, router)
+
+    def _register(self, router: AsyncioRouter) -> None:
+        self.routers[router.deployment_id].add(router)
+
+        # Remove the entries for any deployment ids that no longer have any routers.
+        # The WeakSets will automatically lose track of Routers that get GC'd,
+        # but the outer dict will keep the key around, so we need to clean up manually.
+        # Note the list(...) to avoid mutating self.routers while iterating over it.
+        for deployment_id, routers in list(self.routers.items()):
+            if not routers:
+                self.routers.pop(deployment_id)
+
+        # Register the new listeners on the long poll client.
+        # Some of these listeners may already exist, but it's safe to add them again.
+        key_listeners = {
+            (LongPollNamespace.DEPLOYMENT_TARGETS, deployment_id): partial(
+                self.update_deployment_targets, deployment_id=deployment_id
+            )
+            for deployment_id in self.routers.keys()
+        } | {
+            (LongPollNamespace.DEPLOYMENT_CONFIG, deployment_id): partial(
+                self.update_deployment_config, deployment_id=deployment_id
+            )
+            for deployment_id in self.routers.keys()
+        }
+        self.long_poll_client.add_key_listeners(key_listeners)
+
+
+class CurrentLoopRouter(Router):
+    """Wrapper class that runs an AsyncioRouter on the current asyncio loop.
+    Note that this class is NOT THREAD-SAFE, and all methods are expected to be
+    invoked from a single asyncio event loop.
+    """
+
+    def __init__(self, **passthrough_kwargs):
+        assert (
+            "event_loop" not in passthrough_kwargs
+        ), "CurrentLoopRouter uses the current event loop."
+
+        self._asyncio_loop = asyncio.get_running_loop()
+        self._asyncio_router = AsyncioRouter(
+            event_loop=self._asyncio_loop,
+            _request_router_initialized_event=asyncio.Event(),
+            **passthrough_kwargs,
+        )
+
+    def running_replicas_populated(self) -> bool:
+        return self._asyncio_router.running_replicas_populated()
+
+    def assign_request(
+        self,
+        request_meta: RequestMetadata,
+        *request_args,
+        **request_kwargs,
+    ) -> asyncio.Future[ReplicaResult]:
+        return self._asyncio_loop.create_task(
+            self._asyncio_router.assign_request(
+                request_meta, *request_args, **request_kwargs
+            ),
+        )
+
+    def shutdown(self) -> asyncio.Future:
+        return self._asyncio_loop.create_task(self._asyncio_router.shutdown())

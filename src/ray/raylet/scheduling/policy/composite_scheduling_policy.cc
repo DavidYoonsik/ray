@@ -16,16 +16,13 @@
 
 #include <functional>
 
-#include "ray/util/container_util.h"
-#include "ray/util/util.h"
-
 namespace ray {
 
 namespace raylet_scheduling_policy {
 
 scheduling::NodeID CompositeSchedulingPolicy::Schedule(
     const ResourceRequest &resource_request, SchedulingOptions options) {
-  switch (options.scheduling_type) {
+  switch (options.scheduling_type_) {
   case SchedulingType::SPREAD:
     return spread_policy_.Schedule(resource_request, options);
   case SchedulingType::RANDOM:
@@ -36,10 +33,12 @@ scheduling::NodeID CompositeSchedulingPolicy::Schedule(
     return node_affinity_policy_.Schedule(resource_request, options);
   case SchedulingType::AFFINITY_WITH_BUNDLE:
     return affinity_with_bundle_policy_.Schedule(resource_request, options);
+  case SchedulingType::NODE_LABEL:
+    return node_label_scheduling_policy_.Schedule(resource_request, options);
   default:
     RAY_LOG(FATAL) << "Unsupported scheduling type: "
                    << static_cast<typename std::underlying_type<SchedulingType>::type>(
-                          options.scheduling_type);
+                          options.scheduling_type_);
   }
   UNREACHABLE;
 }
@@ -47,7 +46,7 @@ scheduling::NodeID CompositeSchedulingPolicy::Schedule(
 SchedulingResult CompositeBundleSchedulingPolicy::Schedule(
     const std::vector<const ResourceRequest *> &resource_request_list,
     SchedulingOptions options) {
-  switch (options.scheduling_type) {
+  switch (options.scheduling_type_) {
   case SchedulingType::BUNDLE_PACK:
     return bundle_pack_policy_.Schedule(resource_request_list, options);
   case SchedulingType::BUNDLE_SPREAD:
@@ -59,7 +58,7 @@ SchedulingResult CompositeBundleSchedulingPolicy::Schedule(
   default:
     RAY_LOG(FATAL) << "Unsupported scheduling type: "
                    << static_cast<typename std::underlying_type<SchedulingType>::type>(
-                          options.scheduling_type);
+                          options.scheduling_type_);
   }
   UNREACHABLE;
 }

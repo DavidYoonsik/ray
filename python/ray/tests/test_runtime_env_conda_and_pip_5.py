@@ -1,6 +1,7 @@
 import sys
+
 import pytest
-from pkg_resources import Requirement
+from packaging.version import parse
 
 import ray
 
@@ -8,8 +9,11 @@ import ray
 def test_runtime_env_with_pip_config(start_cluster):
 
     pip_versions = [
-        "==20.2.3",
-        "<20.3, >19",
+        ("==24.1.2", lambda pip_version: parse(pip_version) == parse("24.1.2")),
+        (
+            "<24.2, >19",
+            lambda pip_version: parse("19") < parse(pip_version) < parse("24.2"),
+        ),
     ]
 
     @ray.remote
@@ -18,9 +22,9 @@ def test_runtime_env_with_pip_config(start_cluster):
 
         return pip.__version__
 
-    for pip_version in pip_versions:
-        requirement = Requirement.parse(f"pip{pip_version}")
-        assert (
+    for pip_version_tup in pip_versions:
+        pip_version, check_func = pip_version_tup
+        assert check_func(
             ray.get(
                 f.options(
                     runtime_env={
@@ -31,7 +35,6 @@ def test_runtime_env_with_pip_config(start_cluster):
                     }
                 ).remote()
             )
-            in requirement
         )
 
 
@@ -54,10 +57,14 @@ def test_runtime_env_with_conflict_pip_version(start_cluster):
     assert f"No matching distribution found for pip{pip_version}" in str(error.value)
 
 
+@pytest.mark.skipif(
+    sys.version_info.major == 3 and sys.version_info.minor >= 12,
+    reason="Only pip 23+ support python 3.12 and conflict check always exists",
+)
 def test_runtime_env_cache_with_pip_check(start_cluster):
 
-    # moto require requests>=2.5
-    conflict_packages = ["moto==3.0.5", "requests==2.4.0"]
+    # requests 2.32.3 depends on idna>=2.5, so it's a conflict.
+    conflict_packages = ["idna==2.4", "requests==2.32.3"]
     runtime_env = {
         "pip": {
             "packages": conflict_packages,
@@ -79,8 +86,8 @@ def test_runtime_env_cache_with_pip_check(start_cluster):
         ray.get(f.options(runtime_env=runtime_env).remote())
 
     assert "The conflict is caused by:" in str(error.value)
-    assert "The user requested requests==2.4.0" in str(error.value)
-    assert "moto 3.0.5 depends on requests>=2.5" in str(error.value)
+    assert "The user requested idna==2.4" in str(error.value)
+    assert "requests 2.32.3 depends on idna<4 and >=2.5" in str(error.value)
 
     runtime_env["pip"]["pip_check"] = True
     runtime_env["pip"]["pip_version"] = "==20.2.3"
@@ -91,9 +98,5 @@ def test_runtime_env_cache_with_pip_check(start_cluster):
 
 
 if __name__ == "__main__":
-    import os
 
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

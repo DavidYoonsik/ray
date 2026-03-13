@@ -5,15 +5,15 @@ from ray.rllib.connectors.connector import (
     ConnectorContext,
 )
 from ray.rllib.connectors.registry import register_connector
+from ray.rllib.utils.annotations import OldAPIStack
 from ray.rllib.utils.spaces.space_utils import (
     get_base_struct_from_space,
     unsquash_action,
 )
 from ray.rllib.utils.typing import ActionConnectorDataType
-from ray.util.annotations import PublicAPI
 
 
-@PublicAPI(stability="alpha")
+@OldAPIStack
 class NormalizeActionsConnector(ActionConnector):
     def __init__(self, ctx: ConnectorContext):
         super().__init__(ctx)

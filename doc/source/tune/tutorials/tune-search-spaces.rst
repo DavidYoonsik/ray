@@ -59,7 +59,7 @@ If ``grid_search`` is provided as an argument, the *same* grid will be repeated 
     tuner.fit()
 
     # 3 different configs.
-    tuner = tune.Tuner(trainable, tune_config=tune.TuneConfig(num_samples=1), param_space={"x": grid_search([1, 2, 3])})
+    tuner = tune.Tuner(trainable, tune_config=tune.TuneConfig(num_samples=1), param_space={"x": tune.grid_search([1, 2, 3])})
     tuner.fit()
 
     # 6 different configs.
@@ -110,7 +110,7 @@ for a total of 90 trials, each with randomly sampled values of ``alpha`` and ``b
 
     tuner = tune.Tuner(
         my_trainable,
-        run_config=air.RunConfig(name="my_trainable"),
+        run_config=tune.RunConfig(name="my_trainable"),
         # num_samples will repeat the entire config 10 times.
         tune_config=tune.TuneConfig(num_samples=10),
         param_space={
@@ -170,7 +170,7 @@ This lets you specify conditional parameter distributions.
 
     tuner = tune.Tuner(
         my_trainable,
-        run_config=air.RunConfig(name="my_trainable"),
+        run_config=RunConfig(name="my_trainable"),
         param_space={
             "alpha": tune.sample_from(lambda spec: np.random.uniform(100)),
             "beta": tune.sample_from(lambda spec: spec.config.alpha * np.random.normal()),

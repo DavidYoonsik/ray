@@ -17,7 +17,7 @@ Then you select a `search algorithm` to effectively optimize your parameters and
 `scheduler` to stop searches early and speed up your experiments.
 Together with other configuration, your `trainable`, search algorithm, and scheduler are passed into ``Tuner``,
 which runs your experiments and creates `trials`.
-These trials can then be used in `analyses` to inspect your experiment results.
+The `Tuner` returns a `ResultGrid` to inspect your experiment results.
 The following figure shows an overview of these components, which we cover in detail in the next sections.
 
 .. image:: images/tune_flow.png
@@ -33,7 +33,7 @@ and the :ref:`Class API <tune-class-api>`.
 Both are valid ways of defining a `trainable`, but the Function API is generally recommended and is used
 throughout the rest of this guide.
 
-Let's say we want to optimize a simple objective function like ``a (x ** 2) + b`` in which ``a`` and ``b`` are the
+Consider an example of optimizing a simple objective function like ``a * (x ** 2) + b`` in which ``a`` and ``b`` are the
 hyperparameters we want to tune to `minimize` the objective.
 Since the objective also has a variable ``x``, we need to test for different values of ``x``.
 Given concrete choices for ``a``, ``b`` and ``x`` we can evaluate the objective function and get a `score` to minimize.
@@ -42,7 +42,7 @@ Given concrete choices for ``a``, ``b`` and ``x`` we can evaluate the objective 
 
     .. tab-item:: Function API
 
-        With the :ref:`the function-based API <tune-function-api>` you create a function (here called ``trainable``) that
+        With the :ref:`function-based API <tune-function-api>` you create a function (here called ``trainable``) that
         takes in a dictionary of hyperparameters.
         This function computes a ``score`` in a "training loop" and `reports` this score back to Tune:
 
@@ -51,11 +51,11 @@ Given concrete choices for ``a``, ``b`` and ``x`` we can evaluate the objective 
             :start-after: __function_api_start__
             :end-before: __function_api_end__
 
-        Note that we use ``session.report(...)`` to report the intermediate ``score`` in the training loop, which can be useful
+        Note that we use ``tune.report(...)`` to report the intermediate ``score`` in the training loop, which can be useful
         in many machine learning tasks.
         If you just want to report the final ``score`` outside of this loop, you can simply return the score at the
         end of the ``trainable`` function with ``return {"score": score}``.
-        You can also use ``yield {"score": score}`` instead of ``session.report()``.
+        You can also use ``yield {"score": score}`` instead of ``tune.report()``.
 
     .. tab-item:: Class API
 
@@ -66,10 +66,10 @@ Given concrete choices for ``a``, ``b`` and ``x`` we can evaluate the objective 
             :start-after: __class_api_start__
             :end-before: __class_api_end__
 
-        .. tip:: ``session.report`` can't be used within a ``Trainable`` class.
+        .. tip:: ``tune.report`` can't be used within a ``Trainable`` class.
 
 Learn more about the details of :ref:`Trainables here <trainable-docs>`
-and :ref:`have a look at our examples <tune-general-examples>`.
+and :ref:`have a look at our examples <tune-examples-others>`.
 Next, let's have a closer look at what the ``config`` dictionary is that you pass into your trainables.
 
 .. _tune-key-concepts-search-spaces:
@@ -181,7 +181,7 @@ Simply pass in a ``search_alg`` argument to ``tune.TuneConfig``, which is taken 
     :end-before: __bayes_end__
 
 Tune has Search Algorithms that integrate with many popular **optimization** libraries,
-such as :ref:`Nevergrad <nevergrad>`, :ref:`HyperOpt <tune-hyperopt>`, or :ref:`Optuna <tune-optuna>`.
+such as :ref:`HyperOpt <tune-hyperopt>` or :ref:`Optuna <tune-optuna>`.
 Tune automatically converts the provided search space into the search
 spaces the search algorithms and underlying libraries expect.
 See the :ref:`Search Algorithm API documentation <tune-search-alg>` for more details.
@@ -204,22 +204,6 @@ Here's an overview of all available search algorithms in Tune:
      - Bayesian/Bandit Optimization
      - [`Ax <https://ax.dev/>`__]
      - :doc:`/tune/examples/includes/ax_example`
-   * - :ref:`BlendSearch <BlendSearch>`
-     - Blended Search
-     - [`Bs <https://github.com/microsoft/FLAML/tree/main/flaml/tune>`__]
-     - :doc:`/tune/examples/includes/blendsearch_example`
-   * - :ref:`CFO <CFO>`
-     - Cost-Frugal hyperparameter Optimization
-     - [`Cfo <https://github.com/microsoft/FLAML/tree/main/flaml/tune>`__]
-     - :doc:`/tune/examples/includes/cfo_example`
-   * - :ref:`DragonflySearch <Dragonfly>`
-     - Scalable Bayesian Optimization
-     - [`Dragonfly <https://dragonfly-opt.readthedocs.io/>`__]
-     - :doc:`/tune/examples/includes/dragonfly_example`
-   * - :ref:`SkoptSearch <skopt>`
-     - Bayesian Optimization
-     - [`Scikit-Optimize <https://scikit-optimize.github.io>`__]
-     - :doc:`/tune/examples/includes/skopt_example`
    * - :ref:`HyperOptSearch <tune-hyperopt>`
      - Tree-Parzen Estimators
      - [`HyperOpt <http://hyperopt.github.io/hyperopt>`__]
@@ -240,18 +224,6 @@ Here's an overview of all available search algorithms in Tune:
      - Optuna search algorithms
      - [`Optuna <https://optuna.org/>`__]
      - :doc:`/tune/examples/optuna_example`
-   * - :ref:`ZOOptSearch <zoopt>`
-     - Zeroth-order Optimization
-     - [`ZOOpt <https://github.com/polixir/ZOOpt>`__]
-     - :doc:`/tune/examples/includes/zoopt_example`
-   * - :ref:`SigOptSearch <sigopt>`
-     - Closed source
-     - [`SigOpt <https://sigopt.com/>`__]
-     - :doc:`/tune/examples/includes/sigopt_example`
-   * - :ref:`HEBOSearch <tune-hebo>`
-     - Heteroscedastic Evolutionary Bayesian Optimization
-     - [`HEBO <https://github.com/huawei-noah/HEBO/tree/master/HEBO>`__]
-     - :doc:`/tune/examples/includes/hebo_example`
 
 .. note:: Unlike :ref:`Tune's Trial Schedulers <tune-schedulers>`,
     Tune Search Algorithms cannot affect or stop training processes.
@@ -266,7 +238,7 @@ Tune also provides helpful utilities to use with Search Algorithms:
  * :ref:`limiter`: Limits the amount of concurrent trials when running optimization.
  * :ref:`shim`: Allows creation of the search algorithm object given a string.
 
-Note that in the example above we  tell Tune to ``stop`` after ``20`` training iterations.
+Note that in the example above we tell Tune to ``stop`` after ``20`` training iterations.
 This way of stopping trials with explicit rules is useful, but in many cases we can do even better with
 `schedulers`.
 
@@ -276,7 +248,7 @@ Tune Schedulers
 ---------------
 
 To make your training process more efficient, you can use a :ref:`Trial Scheduler <tune-schedulers>`.
-For instance, in our ``trainable`` example minimizing a function in a training loop, we used ``session.report()``.
+For instance, in our ``trainable`` example minimizing a function in a training loop, we used ``tune.report()``.
 This reported `incremental` results, given a hyperparameter configuration selected by a search algorithm.
 Based on these reported results, a Tune scheduler can decide whether to stop the trial early or not.
 If you don't specify a scheduler, Tune will use a first-in-first-out (FIFO) scheduler by default, which simply
@@ -284,7 +256,7 @@ passes through the trials selected by your search algorithm in the order they we
 
 In short, schedulers can stop, pause, or tweak the
 hyperparameters of running trials, potentially making your hyperparameter tuning process much faster.
-Unlike search algorithms, :ref:`Trial Scheduler <tune-schedulers>` do not select which hyperparameter
+Unlike search algorithms, :ref:`Trial Schedulers <tune-schedulers>` do not select which hyperparameter
 configurations to evaluate.
 
 Here's a quick example of using the so-called ``HyperBand`` scheduler to tune an experiment.
@@ -350,8 +322,8 @@ Learn more about trial schedulers in :ref:`the scheduler API documentation <sche
 
 .. _tune-concepts-analysis:
 
-Tune Run Analyses
------------------
+Tune ResultGrid
+---------------
 
 ``Tuner.fit()`` returns an :ref:`ResultGrid <tune-analysis-docs>` object which has methods you can use for
 analyzing your training.
@@ -371,7 +343,7 @@ allowing you to do ad-hoc data analysis over your results.
     :start-after: __results_start__
     :end-before: __results_end__
 
-See :doc:`/tune/examples/tune_analyze_results` for more usage examples.
+See the :ref:`result analysis user guide <tune-analysis-guide>` for more usage examples.
 
 What's Next?
 -------------

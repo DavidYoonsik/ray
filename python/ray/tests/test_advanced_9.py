@@ -1,21 +1,27 @@
+import os
+import subprocess
 import sys
-import time
 
 import pytest
 
 import ray
-from ray._private.test_utils import (
+import ray._private.ray_constants as ray_constants
+from ray._common.network_utils import parse_address
+from ray._common.test_utils import (
     Semaphore,
-    enable_external_redis,
-    client_test_enabled,
     run_string_as_driver,
     wait_for_condition,
+)
+from ray._private.test_utils import (
+    client_test_enabled,
+    external_redis_test_enabled,
     get_gcs_memory_used,
     run_string_as_driver_nonblocking,
 )
+from ray._raylet import GCS_PID_KEY, GcsClient
 from ray.experimental.internal_kv import _internal_kv_list
 from ray.tests.conftest import call_ray_start
-import subprocess
+
 import psutil
 
 
@@ -61,42 +67,11 @@ def test_back_pressure(shutdown_only_with_initialization_check):
     ray.shutdown()
 
 
-def test_local_mode_deadlock(shutdown_only_with_initialization_check):
-    ray.init(local_mode=True)
-
-    @ray.remote
-    class Foo:
-        def __init__(self):
-            pass
-
-        def ping_actor(self, actor):
-            actor.ping.remote()
-            return 3
-
-    @ray.remote
-    class Bar:
-        def __init__(self):
-            pass
-
-        def ping(self):
-            return 1
-
-    foo = Foo.remote()
-    bar = Bar.remote()
-    # Expect ping_actor call returns normally without deadlock.
-    assert ray.get(foo.ping_actor.remote(bar)) == 3
-
-
 def function_entry_num(job_id):
     from ray._private.ray_constants import KV_NAMESPACE_FUNCTION_TABLE
 
     return (
         len(
-            _internal_kv_list(
-                b"IsolatedExports:" + job_id, namespace=KV_NAMESPACE_FUNCTION_TABLE
-            )
-        )
-        + len(
             _internal_kv_list(
                 b"RemoteFunction:" + job_id, namespace=KV_NAMESPACE_FUNCTION_TABLE
             )
@@ -194,10 +169,9 @@ def test_node_liveness_after_restart(ray_start_cluster):
     wait_for_condition(lambda: len([n for n in ray.nodes() if n["Alive"]]) == 2)
 
     cluster.remove_node(worker)
+    wait_for_condition(lambda: len([n for n in ray.nodes() if n["Alive"]]) == 1)
     worker = cluster.add_node(node_manager_port=9037)
-    for _ in range(10):
-        wait_for_condition(lambda: len([n for n in ray.nodes() if n["Alive"]]) == 2)
-        time.sleep(1)
+    wait_for_condition(lambda: len([n for n in ray.nodes() if n["Alive"]]) == 2)
 
 
 @pytest.mark.skipif(
@@ -207,8 +181,6 @@ def test_node_liveness_after_restart(ray_start_cluster):
 def test_worker_oom_score(shutdown_only):
     @ray.remote
     def get_oom_score():
-        import os
-
         pid = os.getpid()
         with open(f"/proc/{pid}/oom_score", "r") as f:
             oom_score = f.read()
@@ -220,7 +192,7 @@ def test_worker_oom_score(shutdown_only):
 call_ray_start_2 = call_ray_start
 
 
-@pytest.mark.skipif(not enable_external_redis(), reason="Only valid in redis env")
+@pytest.mark.skipif(not external_redis_test_enabled(), reason="Only valid in redis env")
 @pytest.mark.parametrize(
     "call_ray_start,call_ray_start_2",
     [
@@ -267,19 +239,22 @@ def test_gcs_connection_no_leak(ray_start_cluster):
     gcs_server_process = head_node.all_processes["gcs_server"][0].process
     gcs_server_pid = gcs_server_process.pid
 
-    ray.init(cluster.address)
-
     def get_gcs_num_of_connections():
         p = psutil.Process(gcs_server_pid)
-        print(">>", len(p.connections()))
-        return len(p.connections())
+        num_connections = len(p.connections())
+        print(">>", num_connections)
+        return num_connections
 
-    # Wait for everything to be ready.
-    import time
+    @ray.remote
+    class GcsKVActor:
+        def __init__(self, address):
+            self.gcs_client = GcsClient(address=address)
+            self.gcs_client.internal_kv_get(
+                GCS_PID_KEY.encode(),
+            )
 
-    time.sleep(10)
-
-    fds_without_workers = get_gcs_num_of_connections()
+        def ready(self):
+            return "WORLD"
 
     @ray.remote
     class A:
@@ -287,17 +262,29 @@ def test_gcs_connection_no_leak(ray_start_cluster):
             print("HELLO")
             return "WORLD"
 
-    num_of_actors = 10
-    actors = [A.remote() for _ in range(num_of_actors)]
-    print(ray.get([t.ready.remote() for t in actors]))
+    gcs_kv_actor = None
 
-    # Kill the actors
-    del actors
+    with ray.init(cluster.address):
+        # Wait for workers  to be ready.
+        gcs_kv_actor = GcsKVActor.remote(cluster.address)
+        _ = ray.get(gcs_kv_actor.ready.remote())
+        # Note: `fds_with_some_workers` need to be recorded *after* `ray.init`, because
+        # a prestarted worker is started on the first driver init. This worker keeps 1
+        # connection to the GCS, and it stays alive even after the driver exits. If
+        # we move this line before `ray.init`, we will find 1 extra connection after
+        # the driver exits.
+        fds_with_some_workers = get_gcs_num_of_connections()
+        num_of_actors = 10
+        actors = [A.remote() for _ in range(num_of_actors)]
+        print(ray.get([t.ready.remote() for t in actors]))
+
+        # Kill the actors
+        del actors
 
     # Make sure the # of fds opened by the GCS dropped.
     # This assumes worker processes are not created after the actor worker
     # processes die.
-    wait_for_condition(lambda: get_gcs_num_of_connections() <= fds_without_workers)
+    wait_for_condition(lambda: get_gcs_num_of_connections() < fds_with_some_workers)
     num_fds_after_workers_die = get_gcs_num_of_connections()
 
     n = cluster.add_node(wait=True)
@@ -308,7 +295,7 @@ def test_gcs_connection_no_leak(ray_start_cluster):
     cluster.remove_node(n)
 
     # Make sure the # of fds opened by the GCS dropped.
-    wait_for_condition(lambda: get_gcs_num_of_connections() <= fds_without_workers)
+    wait_for_condition(lambda: get_gcs_num_of_connections() < fds_with_some_workers)
 
 
 @pytest.mark.parametrize(
@@ -325,7 +312,7 @@ import os
 import time
 @ray.remote(num_cpus=3)
 def use_gpu():
-    time.sleep(1)
+    pass
 
 @ray.remote(num_gpus=10)
 class A:
@@ -353,24 +340,24 @@ print(ray.get([use_gpu.remote(), use_gpu.remote()]))
     wait_for_condition(lambda: check_demands(1))
 
 
-@pytest.mark.skipif(enable_external_redis(), reason="Only valid in non redis env")
+@pytest.mark.skipif(external_redis_test_enabled(), reason="Only valid in non redis env")
 def test_redis_not_available(monkeypatch, call_ray_stop_only):
-    monkeypatch.setenv("RAY_NUM_REDIS_GET_RETRIES", "2")
+    monkeypatch.setenv("RAY_redis_db_connect_retries", "5")
     monkeypatch.setenv("RAY_REDIS_ADDRESS", "localhost:12345")
+
     p = subprocess.run(
         "ray start --head",
         shell=True,
         capture_output=True,
     )
     assert "Could not establish connection to Redis" in p.stderr.decode()
-    assert "Please check" in p.stderr.decode()
-    assert "gcs_server.out for details" in p.stderr.decode()
-    assert "RuntimeError: Failed to start GCS" in p.stderr.decode()
+    assert "Please check " in p.stderr.decode()
+    assert "redis storage is alive or not." in p.stderr.decode()
 
 
-@pytest.mark.skipif(not enable_external_redis(), reason="Only valid in redis env")
+@pytest.mark.skipif(not external_redis_test_enabled(), reason="Only valid in redis env")
 def test_redis_wrong_password(monkeypatch, external_redis, call_ray_stop_only):
-    monkeypatch.setenv("RAY_NUM_REDIS_GET_RETRIES", "2")
+    monkeypatch.setenv("RAY_redis_db_connect_retries", "5")
     p = subprocess.run(
         "ray start --head  --redis-password=1234",
         shell=True,
@@ -378,18 +365,15 @@ def test_redis_wrong_password(monkeypatch, external_redis, call_ray_stop_only):
     )
 
     assert "RedisError: ERR AUTH <password> called" in p.stderr.decode()
-    assert "Please check /tmp/ray/session" in p.stderr.decode()
-    assert "RuntimeError: Failed to start GCS" in p.stderr.decode()
 
 
-@pytest.mark.skipif(not enable_external_redis(), reason="Only valid in redis env")
+@pytest.mark.skipif(not external_redis_test_enabled(), reason="Only valid in redis env")
 def test_redis_full(ray_start_cluster_head):
-    import os
     import redis
 
     gcs_address = ray_start_cluster_head.gcs_address
     redis_addr = os.environ["RAY_REDIS_ADDRESS"]
-    host, port = redis_addr.split(":")
+    host, port = parse_address(redis_addr)
     if os.environ.get("TEST_EXTERNAL_REDIS_REPLICAS", "1") != "1":
         cli = redis.RedisCluster(host, int(port))
     else:
@@ -399,8 +383,10 @@ def test_redis_full(ray_start_cluster_head):
 
     gcs_cli = ray._raylet.GcsClient(address=gcs_address)
     # GCS should fail
+    # GcsClient assumes GCS is HA so it keeps retrying, although GCS is down. We must
+    # set timeout for this.
     with pytest.raises(ray.exceptions.RpcError):
-        gcs_cli.internal_kv_put(b"A", b"A" * 6 * 1024 * 1024, True, None)
+        gcs_cli.internal_kv_put(b"A", b"A" * 6 * 1024 * 1024, True, timeout=5)
     logs_dir = ray_start_cluster_head.head_node._logs_dir
 
     with open(os.path.join(logs_dir, "gcs_server.err")) as err:
@@ -451,8 +437,6 @@ def test_gcs_fd_usage(shutdown_only):
     @ray.remote(runtime_env={"env_vars": {"Hello": "World"}})
     class A:
         def f(self):
-            import os
-
             return os.environ.get("Hello")
 
     # In case there are still some pre-start workers, consume all of them
@@ -475,11 +459,47 @@ def test_gcs_fd_usage(shutdown_only):
     assert (new_fd_num - base_fd_num) <= len(bb) * 2 + 1
 
 
-if __name__ == "__main__":
-    import pytest
-    import os
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="jemalloc is only prebuilt on linux"
+)
+def test_jemalloc_ray_start(monkeypatch, ray_start_cluster):
+    def check_jemalloc_enabled(pid=None):
+        if pid is None:
+            pid = os.getpid()
+        pmap = subprocess.run(
+            ["pmap", str(pid)], check=True, text=True, stdout=subprocess.PIPE
+        )
+        return "libjemalloc.so" in pmap.stdout
 
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    # Firstly, remove the LD_PRELOAD and make sure
+    # jemalloc is loaded.
+    monkeypatch.delenv("LD_PRELOAD", False)
+    cluster = ray_start_cluster
+    node = cluster.add_node(num_cpus=1)
+
+    # Make sure raylet/gcs/worker all have jemalloc
+    assert check_jemalloc_enabled(
+        node.all_processes[ray_constants.PROCESS_TYPE_GCS_SERVER][0].process.pid
+    )
+    assert check_jemalloc_enabled(
+        node.all_processes[ray_constants.PROCESS_TYPE_RAYLET][0].process.pid
+    )
+    assert not ray.get(ray.remote(check_jemalloc_enabled).remote())
+
+    ray.shutdown()
+    cluster.shutdown()
+
+    monkeypatch.setenv("LD_PRELOAD", "")
+    node = cluster.add_node(num_cpus=1)
+    # Make sure raylet/gcs/worker all have jemalloc
+    assert not check_jemalloc_enabled(
+        node.all_processes[ray_constants.PROCESS_TYPE_GCS_SERVER][0].process.pid
+    )
+    assert not check_jemalloc_enabled(
+        node.all_processes[ray_constants.PROCESS_TYPE_RAYLET][0].process.pid
+    )
+    assert not ray.get(ray.remote(check_jemalloc_enabled).remote())
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main(["-sv", __file__]))

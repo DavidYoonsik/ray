@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 
@@ -11,7 +12,19 @@ def to_dict_key(key: str):
 
 
 if __name__ == "__main__":
-    from ray._private.ray_perf import main
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--experimental",
+        action="store_true",
+        default=False,
+        help="If passed, run ray.experimental microbenchmarks.",
+    )
+    args = parser.parse_args()
+
+    if args.experimental:
+        from ray._private.ray_experimental_perf import main
+    else:
+        from ray._private.ray_perf import main
 
     results = main() or []
 

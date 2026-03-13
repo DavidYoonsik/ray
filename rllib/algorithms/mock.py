@@ -4,9 +4,9 @@ import time
 
 import numpy as np
 
-from ray.tune import result as tune_result
 from ray.rllib.algorithms.algorithm import Algorithm, AlgorithmConfig
 from ray.rllib.utils.annotations import override
+from ray.tune import result as tune_result
 
 
 class _MockTrainer(Algorithm):
@@ -64,11 +64,11 @@ class _MockTrainer(Algorithm):
         path = os.path.join(checkpoint_dir, "mock_agent.pkl")
         with open(path, "wb") as f:
             pickle.dump(self.info, f)
-        return path
 
     @override(Algorithm)
-    def load_checkpoint(self, checkpoint_path):
-        with open(checkpoint_path, "rb") as f:
+    def load_checkpoint(self, checkpoint_dir):
+        path = os.path.join(checkpoint_dir, "mock_agent.pkl")
+        with open(path, "rb") as f:
             info = pickle.load(f)
         self.info = info
         self.restored = True

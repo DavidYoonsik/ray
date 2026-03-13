@@ -3,9 +3,14 @@
 # and the latest version has a compatibility issue with the latest OpenCensus
 # library.
 
+import logging
 import re
+import threading
+from wsgiref.simple_server import make_server
 
-from prometheus_client import start_http_server
+from opencensus.common.transports import sync
+from opencensus.stats import aggregation_data as aggregation_data_module, base_exporter
+from prometheus_client import make_wsgi_app
 from prometheus_client.core import (
     REGISTRY,
     CounterMetricFamily,
@@ -13,11 +18,6 @@ from prometheus_client.core import (
     HistogramMetricFamily,
     UnknownMetricFamily,
 )
-
-from opencensus.common.transports import sync
-from opencensus.stats import aggregation_data as aggregation_data_module
-from opencensus.stats import base_exporter
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +137,6 @@ class Collector(object):
                 :class:`~prometheus_client.core.HistogramMetricFamily` or
                 :class:`~prometheus_client.core.UnknownMetricFamily` or
                 :class:`~prometheus_client.core.GaugeMetricFamily`
-        :returns: A Prometheus metric object
         """
         metric_name = desc["name"]
         metric_description = desc["documentation"]
@@ -160,7 +159,7 @@ class Collector(object):
                 )
                 metrics_map[metric_name] = metric
             metric.add_metric(labels=tag_values, value=agg_data.count_data)
-            return metric
+            return
 
         elif isinstance(agg_data, aggregation_data_module.DistributionAggregationData):
 
@@ -191,7 +190,7 @@ class Collector(object):
                 buckets=buckets,
                 sum_value=agg_data.sum,
             )
-            return metric
+            return
 
         elif isinstance(agg_data, aggregation_data_module.SumAggregationData):
             metric = metrics_map.get(metric_name)
@@ -203,7 +202,7 @@ class Collector(object):
                 )
                 metrics_map[metric_name] = metric
             metric.add_metric(labels=tag_values, value=agg_data.sum_data)
-            return metric
+            return
 
         elif isinstance(agg_data, aggregation_data_module.LastValueAggregationData):
             metric = metrics_map.get(metric_name)
@@ -215,7 +214,7 @@ class Collector(object):
                 )
                 metrics_map[metric_name] = metric
             metric.add_metric(labels=tag_values, value=agg_data.value)
-            return metric
+            return
 
         else:
             raise ValueError(f"unsupported aggregation type {type(agg_data)}")
@@ -235,7 +234,7 @@ class Collector(object):
             desc = self.registered_views[v_name]
             for tag_values in view_data.tag_value_aggregation_data_map:
                 agg_data = view_data.tag_value_aggregation_data_map[tag_values]
-                metric = self.to_metric(desc, tag_values, agg_data, metrics_map)
+                self.to_metric(desc, tag_values, agg_data, metrics_map)
 
         for metric in metrics_map.values():
             yield metric
@@ -267,7 +266,7 @@ class PrometheusStatsExporter(base_exporter.StatsExporter):
         self._gatherer = gatherer
         self._collector = collector
         self._transport = transport(self)
-        self.serve_http()
+        self._port = self.serve_http()
         REGISTRY.register(self._collector)
 
     @property
@@ -293,6 +292,11 @@ class PrometheusStatsExporter(base_exporter.StatsExporter):
     def options(self):
         """Options to be used to configure the exporter"""
         return self._options
+
+    @property
+    def port(self):
+        """The port the HTTP server is listening on."""
+        return self._port
 
     def export(self, view_data):
         """export send the data to the transport class
@@ -320,9 +324,13 @@ class PrometheusStatsExporter(base_exporter.StatsExporter):
 
     def serve_http(self):
         """serve_http serves the Prometheus endpoint."""
-        address = str(self.options.address)
-        kwargs = {"addr": address} if address else {}
-        start_http_server(port=self.options.port, **kwargs)
+        address = self.options.address or ""
+        httpd = make_server(address, self.options.port, make_wsgi_app())
+        t = threading.Thread(target=httpd.serve_forever)
+        t.daemon = True
+        t.start()
+        # Return the actual port (in case port=0 was specified)
+        return httpd.server_address[1]
 
 
 def new_stats_exporter(option):
